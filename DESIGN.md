@@ -56,62 +56,78 @@ LT 是**无状态**的——每条请求独立检查，没有跨事件记忆。�
 
 ## 2. 系统全貌
 
-### 2.1 拓扑
+### 2.1 拓扑(2026-05-15 23:50 同步现实)
 
 ```
-User
-  │
-  ▼
-┌────────────────┐
-│ Router agent   │  (LangChain agent loop, Python)
-└──┬─────────────┘
+User input
    │
-   ├──▶ ask_hr_agent       ──▶ ┌─────────────────┐
-   │                            │ HR sub-agent    │
-   │                            └─────────────────┘
-   │
-   ├──▶ ask_finance_agent  ──▶ ┌─────────────────┐
-   │                            │ Finance sub     │
-   │                            └─────────────────┘
-   │
-   └──▶ ask_it_agent       ──▶ ┌─────────────────┐
-                                │ IT sub          │
-                                └─────────────────┘
+   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ lt_agents (LangGraph StateGraph,Python 单进程)                       │
+│                                                                       │
+│   ┌─────────────┐                                                     │
+│   │   Router    │  (LLM classifies: HR / FINANCE / IT)                │
+│   └──────┬──────┘                                                     │
+│          │ conditional edge                                           │
+│   ┌──────┼──────────┬──────────────┐                                 │
+│   ▼      ▼          ▼              ▼                                  │
+│ ┌────┐ ┌──────┐ ┌─────────┐  ┌──────────┐                            │
+│ │ HR │ │  IT  │ │ Finance │  │ ToolNode │ ← role:"tool" messages    │
+│ └────┘ └──────┘ └─────────┘  └──────────┘                            │
+│   每 worker bind_tools 一个自己的 Chroma RAG 工具                     │
+│   (scenario C 额外给 IT bind 一个 fetch_external_calendar 注入工具)   │
+└────────────────────────────────────┬─────────────────────────────────┘
+                                     │ 每次 LLM call: ChatOpenAI(
+                                     │   extra_body={"_lobstertrap":{
+                                     │     "agent_id": ...,
+                                     │     "declared_paths": [...],
+                                     │     "declared_commands": [...],
+                                     │     "declared_domains": [...]
+                                     │   }})
+                                     ▼
+                ┌──────────────────────────────────────┐
+                │ LT-Sentinel reverse proxy :8080      │
+                │   atomic current_tier_port           │
+                └────────┬───────────┬───────────┬─────┘
+                         ▼           ▼           ▼
+                  ┌────────────┐ ┌────────────┐ ┌─────────────┐
+                  │ LT-Trust   │ │ LT-Observe │ │ LT-Lockdown │
+                  │ :18081     │ │ :18082     │ │ :18083      │
+                  │ policy_    │ │ policy_    │ │ policy_     │
+                  │ trust.yaml │ │ observe    │ │ lockdown    │
+                  └──────┬─────┘ └─────┬──────┘ └──────┬──────┘
+                         │             │               │
+                         ▼             ▼               ▼   (audit-log JSONL,
+                  ┌───────────────────────────────────────┐ append-only,
+                  │ LLM backend (Ollama / OpenAI / etc.)  │ 各自一份文件)
+                  └───────────────────────────────────────┘
 
-每个 agent 内部的 LLM 调用都指向：
-
-  ┌──────────────────────────────────┐
-  │  Veea LT (1 个 Go 进程)          │   ← 现状的 LT
-  │  做即时拦截 + 日志输出           │
-  └──────────────┬───────────────────┘
-                 │
-                 ▼
-        LLM 后端 (OpenAI 兼容)
-
-
-  ┌─────────────────────────────────────────┐
-  │  Sentinel (独立进程)                     │   ← 新东西
-  │  tail LT 的 jsonl audit log              │
-  │  - 算 per-agent OER / EWMA / CUSUM       │
-  │  - 维护 per-agent TrustScore             │
-  │  - 任一 agent 跨阈值 → 替换 policy YAML  │
-  │    → LT 热加载 → 全局升档 (连坐制)       │
-  │  - 写 sentinel_events / mode_changes     │
-  │    jsonl, 追根溯源                       │
-  └─────────────────────────────────────────┘
+                  ┌─────────────────────────────────────────────────┐
+                  │ Sentinel monitor (独立进程,同 :8080 反代)         │
+                  │  - tail × 3 audit logs, merge by timestamp       │
+                  │  - per-agent OER / EWMA / CUSUM / TrustScore     │
+                  │  - 任一 agent 跨阈值 → 原子换 current_tier_port    │
+                  │    (in-flight 请求不受影响,新请求走新档 LT)        │
+                  │  - 写 sentinel_events / mode_changes / trust_     │
+                  │    history JSONL,追根溯源                         │
+                  │  - 启动时 replay sentinel_events.jsonl 重建状态    │
+                  └─────────────────────────────────────────────────┘
 ```
 
-### 2.2 数据流
+### 2.2 数据流(同步现实)
 
-1. user 发 prompt → Router → LT → LLM → 返回
-2. Router 决定派单 → 调 `ask_hr_agent` → 这条 LLM 调用也走 LT
-3. HR sub 拿到任务 → 自己的 LLM loop → 还是走 LT
-4. HR sub 调外部工具 → 拿到结果 → 下一轮 LLM 调用走 LT（这里是 C 类攻击进入点）
-5. HR 返回 → Router → 用户
+每个 user 请求产生 2–3 个 LT audit log 入口:
 
-所有 LLM 调用都经过同一个 LT 进程。LT 通过请求 body 的 **`_lobstertrap.agent_id`** 区分是谁在调（见 §3）。
+1. **user input** → lt_agents Router 节点
+2. **Router LLM call** → ChatOpenAI(`agent_id=router`) → Sentinel:8080 反代 → 当前档 LT → LLM backend → 返回分类 token(HR/FINANCE/IT) → 在 LT audit log 留下 1 条 `router` 入口
+3. **Conditional edge** dispatches to one worker node
+4. **Worker LLM call**(`bind_tools` 后)→ ChatOpenAI(`agent_id=hr_agent` 等)→ Sentinel:8080 → LT → backend → worker decides whether to call tool → LT 留下 1 条 worker 入口
+5. **(可选)Tool call** → ToolNode 执行 Chroma 检索(scenario C 时是 `fetch_external_calendar`)→ tool 返回内容作为 **`role:"tool"`** message 回流到 worker
+6. **Worker finalizes** → 用 tool message 作为额外 context 再调 LLM → LT 留下 1 条 worker 入口(可能 risk 已经上升,因 poisoned context)
 
-LT 一边即时拦截，一边把日志/事件吐给我们的 sidecar。Sidecar 算 OER、维护 trust、触发策略升级。
+Sentinel 同时 tail 3 份 LT audit log,合并按 timestamp 输出 OER/EWMA/CUSUM。**任何 agent 的 TrustScore 跨阈值 → Sentinel 原子换上游端口指针 → 下一条请求走新档 LT(老档 in-flight 请求继续完成)→ 写一条 sentinel_mode_changes 审计**。
+
+身份分组键(per-agent OER 的 group-by 字段)来自 LT 写入 audit log 的 `agent_id`,这个 agent_id 来自 agent 在请求 body 里的 `_lobstertrap.agent_id` 声明(§3)。**声明式身份,不是密码学身份**。
 
 ---
 

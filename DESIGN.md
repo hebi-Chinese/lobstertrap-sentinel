@@ -1075,7 +1075,7 @@ judge 规则:`risk_score ≥ 0.40 AND ≥1 critical/warning mismatch` → violat
 
 ### 14.9 已知不一致 — 历史 + 修复记录
 
-**14.9.1 `calibrate.py` 的 SPC CLI 默认 vs runtime 默认**(commit `b9b40c8` 写,**commit `04b8d23` 修**)
+**14.9.1 `calibrate.py` 的 SPC CLI 默认 vs runtime 默认**(commit `c11a2b3` 写,**commit `f2cf9da` 修**)
 
 **问题**:`scenarios/calibrate.py` 4 个 SPC CLI 参数硬编码了文献值,runtime 的 `config.py:SPCParams` 在 λ tuning 后(commit `54368d4`)改成 0.05。结果:`py -m scenarios.calibrate` 无参跑时用 λ=0.2 做 offline replay,**报告的 ARL₀ 不反映 runtime 行为**。
 

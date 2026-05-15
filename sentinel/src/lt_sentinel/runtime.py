@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .audit_writers import ModeChangeLog, SentinelEventLog, TrustHistoryLog
+from .audit_writers import ModeChangeLog, SentinelEventLog, TrustHistoryLog, replay_events
 from .config import SentinelConfig, TIER_TRUST
 from .log_tail import AuditRecord, MultiFileTail
 from .metrics import AgentRegistry
@@ -61,8 +61,18 @@ class SentinelRuntime:
     async def start(self) -> None:
         await self.supervisor.start_all()
 
-        initial_port = self.supervisor.port_for(TIER_TRUST)
-        self._tier_pointer = _AtomicTierPort(port=initial_port, tier=TIER_TRUST)
+        # DESIGN.md §11.6: rebuild in-memory per-agent state from any prior
+        # sentinel_events.jsonl on disk so a crash-restart preserves history.
+        replayed = self._replay_in_memory_state()
+
+        initial_tier, initial_port = self._resolve_startup_tier()
+        self._tier_pointer = _AtomicTierPort(port=initial_port, tier=initial_tier)
+        if replayed > 0:
+            logger.info(
+                "startup replay: rebuilt %d per-agent events; resuming at tier=%s",
+                replayed,
+                initial_tier,
+            )
 
         host, _, port = self.config.sentinel_listen.partition(":")
         self.proxy = TierAwareProxy(
@@ -73,15 +83,21 @@ class SentinelRuntime:
         await self.proxy.start()
 
         # Seed mode-change log with initial tier so reasoning is replayable.
+        snap = self.registry.trust_snapshot()
+        reason = (
+            "Sentinel started; default tier=trust"
+            if not snap
+            else f"Sentinel restarted; replayed state → tier={self._tier_pointer.tier}"
+        )
         self.mode_log.emit(
             from_tier="<init>",
-            to_tier=TIER_TRUST,
+            to_tier=self._tier_pointer.tier,
             trigger_agent="<init>",
             trigger_trust_score=1.0,
             threshold_crossed="<init>",
-            all_agents_trust_snapshot={},
-            policy_yaml_applied="policy_trust.yaml",
-            reason_summary="Sentinel started; default tier=trust",
+            all_agents_trust_snapshot=snap,
+            policy_yaml_applied=f"policy_{self._tier_pointer.tier}.yaml",
+            reason_summary=reason,
         )
 
     async def run_forever(self) -> None:
@@ -101,6 +117,38 @@ class SentinelRuntime:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    # ---- startup replay (DESIGN.md §11.6 last bullet) -----------------------
+
+    def _replay_in_memory_state(self) -> int:
+        """Rebuild AgentRegistry state from `sentinel_events.jsonl`.
+
+        Only the per-agent EWMA / CUSUM / OER window is rebuilt; the events
+        log itself is not touched (the live tailer starts at end-of-file).
+        Returns the number of events replayed.
+        """
+        events_path = self.config.sentinel_events_path
+        if not events_path.exists() or events_path.stat().st_size == 0:
+            return 0
+        n = 0
+        for entry in replay_events(events_path):
+            if entry.get("direction") != "ingress":
+                continue
+            agent_id = entry.get("agent_id") or ""
+            if not agent_id or agent_id == "<anon>":
+                continue
+            state = self.registry.get_or_create(agent_id)
+            state.observe(bool(entry.get("violation")))
+            n += 1
+        return n
+
+    def _resolve_startup_tier(self) -> tuple[str, int]:
+        """After replay, pick the tier matching the worst-case TrustScore."""
+        if not self.registry.trust_snapshot():
+            return TIER_TRUST, self.supervisor.port_for(TIER_TRUST)
+        _, min_trust = self.registry.min_trust()
+        tier = decide_tier(min_trust, self.config.spc)
+        return tier, self.supervisor.port_for(tier)
 
     async def stop(self) -> None:
         self.request_stop()

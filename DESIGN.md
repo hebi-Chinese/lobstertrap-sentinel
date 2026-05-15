@@ -548,7 +548,7 @@ Sentinel 写两类持久化 jsonl,**所有切档事件必须可追根溯源**(20
 - "哪些具体请求是直接证据?" → `recent_violation_events` 里的 request_id 反查 `sentinel_events.jsonl` 再反查 LT audit log
 - 整条链:**LT audit log** ←→ **sentinel_events.jsonl** ←→ **sentinel_mode_changes.jsonl** 通过 request_id / agent_id / ts 串起来
 
-**启动时 replay**:Sentinel 启动读 `sentinel_events.jsonl` 重建 in-memory 状态(OER 窗口 / EWMA / CUSUM)。无状态丢失。
+**启动时 replay**(2026-05-15 实测落地,`SentinelRuntime._replay_in_memory_state()`):Sentinel 启动读 `sentinel_events.jsonl` 重建 in-memory 状态(OER 窗口 / EWMA / CUSUM),跳过 anon / egress 条目。replay 完成后调用 `_resolve_startup_tier()` 按 worst-case TrustScore 决定初始档位 — 崩溃前已经在 lockdown 的 Sentinel 重启后**仍然是 lockdown**,不会回退到 trust。Live tailer 在 `_SingleFileTail` 里 `seek(file.size)` 起步,replay 与 live 路径互不重叠。`tests/test_startup_replay.py` 5 个 case 锁定行为。无状态丢失。
 
 Track 1 加分项 "audit trails a regulator could read" 直接对齐。
 

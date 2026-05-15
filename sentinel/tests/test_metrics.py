@@ -19,8 +19,17 @@ from lt_sentinel.violation import judge
 # ---- helpers ---------------------------------------------------------------
 
 
-def _spc(mu: float = 0.075, sigma: float = 0.048) -> SPCParams:
-    return SPCParams(mu_dev=mu, sigma_dev=sigma)
+def _spc(
+    mu: float = 0.075,
+    sigma: float = 0.048,
+    lam: float = 0.2,
+) -> SPCParams:
+    """Test helper — pins λ explicitly so unit tests stay decoupled from any
+    future runtime tuning of `SPCParams.lambda_ewma`. The math under test
+    (EWMA decay, CUSUM increment, TrustScore mapping) is the same regardless;
+    we just need a known λ to compute expected values.
+    """
+    return SPCParams(mu_dev=mu, sigma_dev=sigma, lambda_ewma=lam)
 
 
 # ---- EWMA ------------------------------------------------------------------

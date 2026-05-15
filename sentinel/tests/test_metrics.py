@@ -319,3 +319,88 @@ def test_judge_severity_score_bounded() -> None:
         )
     )
     assert 0.0 <= v.severity_score <= 1.0
+
+
+# ---- idle decay (DESIGN.md §11.2 dormant-agent recovery) -------------------
+
+
+def _spc_with_decay(half_life: float, mu: float = 0.05, sigma: float = 0.04) -> SPCParams:
+    return SPCParams(
+        mu_dev=mu,
+        sigma_dev=sigma,
+        lambda_ewma=0.2,
+        idle_decay_half_life_s=half_life,
+    )
+
+
+def test_apply_idle_decay_pulls_ewma_toward_mu() -> None:
+    spc = _spc_with_decay(half_life=10.0)
+    s = PerAgentState(agent_id="t", spc=spc)
+    s.ewma = 0.5
+    s.last_event_ts = 100.0
+    # One full half-life later: EWMA should be half-way from 0.5 → µ=0.05
+    s.apply_idle_decay(now=110.0)
+    assert s.ewma == pytest.approx(spc.mu_dev + (0.5 - spc.mu_dev) * 0.5)
+    assert s.last_event_ts == 110.0
+
+
+def test_apply_idle_decay_zero_dt_is_noop() -> None:
+    spc = _spc_with_decay(half_life=10.0)
+    s = PerAgentState(agent_id="t", spc=spc)
+    s.ewma = 0.5
+    s.last_event_ts = 100.0
+    s.apply_idle_decay(now=100.0)
+    assert s.ewma == 0.5
+    s.apply_idle_decay(now=99.0)  # clock moving backward — still no-op
+    assert s.ewma == 0.5
+
+
+def test_apply_idle_decay_disabled_when_half_life_zero() -> None:
+    spc = _spc_with_decay(half_life=0.0)
+    s = PerAgentState(agent_id="t", spc=spc)
+    s.ewma = 0.5
+    s.last_event_ts = 100.0
+    s.apply_idle_decay(now=1_000_000.0)  # arbitrarily far future
+    assert s.ewma == 0.5  # EWMA untouched
+    assert s.last_event_ts == 1_000_000.0  # bookkeeping still advances
+
+
+def test_observe_with_now_applies_decay_before_event() -> None:
+    spc = _spc_with_decay(half_life=10.0)
+    s = PerAgentState(agent_id="t", spc=spc)
+    s.ewma = 0.5
+    s.last_event_ts = 100.0
+    # Half-life later, observe a clean event (violation=False, x=0)
+    s.observe(False, now=110.0)
+    # Step 1 (decay): EWMA = µ + (0.5 − µ)·0.5 = 0.275
+    # Step 2 (EWMA): EWMA_new = 0.2·0 + 0.8·0.275 = 0.220
+    expected_after_decay = spc.mu_dev + (0.5 - spc.mu_dev) * 0.5
+    expected_final = 0.2 * 0 + 0.8 * expected_after_decay
+    assert s.ewma == pytest.approx(expected_final)
+    assert s.last_event_ts == 110.0
+
+
+def test_observe_without_now_is_legacy_behavior() -> None:
+    spc = _spc_with_decay(half_life=10.0)
+    s = PerAgentState(agent_id="t", spc=spc)
+    s.ewma = 0.5
+    s.last_event_ts = 100.0
+    # No `now` arg → no decay applied, only standard EWMA update fires.
+    s.observe(False)
+    # EWMA_new = 0.2·0 + 0.8·0.5 = 0.4
+    assert s.ewma == pytest.approx(0.4)
+    # last_event_ts untouched — backwards-compatible with pre-decay API
+    assert s.last_event_ts == 100.0
+
+
+def test_registry_apply_idle_decay_all_decays_every_agent() -> None:
+    spc = _spc_with_decay(half_life=10.0)
+    reg = AgentRegistry(spc)
+    a = reg.get_or_create("a")
+    b = reg.get_or_create("b")
+    a.ewma, a.last_event_ts = 0.4, 100.0
+    b.ewma, b.last_event_ts = 0.9, 100.0
+    reg.apply_idle_decay_all(now=110.0)
+    assert a.ewma == pytest.approx(spc.mu_dev + (0.4 - spc.mu_dev) * 0.5)
+    assert b.ewma == pytest.approx(spc.mu_dev + (0.9 - spc.mu_dev) * 0.5)
+    assert a.last_event_ts == 110.0 and b.last_event_ts == 110.0

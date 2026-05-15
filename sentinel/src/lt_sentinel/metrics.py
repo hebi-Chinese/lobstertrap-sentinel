@@ -12,6 +12,7 @@ per agent_id seen in the audit stream.
 from __future__ import annotations
 
 import math
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -41,6 +42,11 @@ class PerAgentState:
     n_seen: int = 0
     n_violations: int = 0
 
+    # Wall-clock seconds (time.time()) of the most recent event OR idle-
+    # decay tick. Used to compute elapsed time for idle-decay; reset on
+    # every state-mutating call.
+    last_event_ts: float = field(default_factory=time.time)
+
     def __post_init__(self) -> None:
         # Resize window to spc.window_size and seed EWMA at µ_dev.
         self.window = deque(maxlen=self.spc.window_size)
@@ -48,8 +54,41 @@ class PerAgentState:
 
     # ---- updates -----------------------------------------------------------
 
-    def observe(self, is_violation: bool) -> None:
-        """Update the state given a single chain's outcome."""
+    def apply_idle_decay(self, now: float) -> None:
+        """Pull EWMA fractionally toward µ_dev based on wall-clock time
+        elapsed since the last event/tick. CUSUM is deliberately NOT
+        decayed — it is the cumulative-drift signal and decaying it would
+        break its §12.1 semantics. TrustScore recovery follows for free
+        because it is a pure function of EWMA.
+
+        Idempotent: calling with the same `now` twice has no second effect.
+        Disabled when `spc.idle_decay_half_life_s <= 0`.
+        """
+        hl = self.spc.idle_decay_half_life_s
+        if hl <= 0:
+            self.last_event_ts = now
+            return
+        dt = now - self.last_event_ts
+        if dt <= 0:
+            return
+        # EWMA_new = µ + (EWMA_old − µ) · 0.5^(dt / half_life)
+        factor = 0.5 ** (dt / hl)
+        self.ewma = self.spc.mu_dev + (self.ewma - self.spc.mu_dev) * factor
+        self.last_event_ts = now
+
+    def observe(self, is_violation: bool, *, now: float | None = None) -> None:
+        """Update the state given a single chain's outcome.
+
+        If `now` is provided, idle-decay is applied first (so the EWMA
+        update sees a decay-adjusted prior). If `now` is None the time
+        component is skipped — useful for unit tests that pin behaviour
+        to the event-only math, and backwards-compatible with the
+        pre-decay API.
+        """
+        if now is not None:
+            self.apply_idle_decay(now)
+            self.last_event_ts = now
+
         x = 1 if is_violation else 0
         self.window.append(x)
         self.n_seen += 1
@@ -121,6 +160,14 @@ class AgentRegistry:
 
     def trust_snapshot(self) -> dict[str, float]:
         return {aid: round(s.trust_score, 4) for aid, s in self._states.items()}
+
+    def apply_idle_decay_all(self, now: float) -> None:
+        """Tick every known agent's EWMA toward µ based on `now`. Called
+        on every incoming audit-log record so dormant agents catch up to
+        wall-clock time without a separate background coroutine.
+        """
+        for state in self._states.values():
+            state.apply_idle_decay(now)
 
     def min_trust(self) -> tuple[str | None, float]:
         if not self._states:

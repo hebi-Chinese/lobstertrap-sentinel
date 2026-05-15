@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,30 @@ from .tier_state import decide_tier, transition_reason
 from .violation import judge
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_event_ts(value: Any) -> float | None:
+    """Parse `sentinel_events.jsonl` `ts` (ISO 8601 with optional trailing Z)
+    into wall-clock seconds. Returns None on any parse failure — callers
+    treat that as "skip idle-decay for this event".
+    """
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    # `fromisoformat` on 3.11+ accepts the trailing Z directly; we normalise
+    # for safety on earlier versions and against pre-existing edge cases.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -123,9 +149,13 @@ class SentinelRuntime:
     def _replay_in_memory_state(self) -> int:
         """Rebuild AgentRegistry state from `sentinel_events.jsonl`.
 
-        Only the per-agent EWMA / CUSUM / OER window is rebuilt; the events
-        log itself is not touched (the live tailer starts at end-of-file).
-        Returns the number of events replayed.
+        Each event's `ts` field is parsed into wall-clock seconds and
+        passed into `observe(now=…)` so idle-decay between events applies
+        as it would have in real time. Side effect: after replay,
+        `last_event_ts` equals the timestamp of the most recent event, so
+        the first live event after restart sees `now − last_event_ts`
+        worth of idle decay — i.e. any wall-clock gap during which the
+        process was down counts toward recovery automatically.
         """
         events_path = self.config.sentinel_events_path
         if not events_path.exists() or events_path.stat().st_size == 0:
@@ -138,7 +168,8 @@ class SentinelRuntime:
             if not agent_id or agent_id == "<anon>":
                 continue
             state = self.registry.get_or_create(agent_id)
-            state.observe(bool(entry.get("violation")))
+            ts = _parse_event_ts(entry.get("ts"))
+            state.observe(bool(entry.get("violation")), now=ts)
             n += 1
         return n
 
@@ -178,6 +209,13 @@ class SentinelRuntime:
         assert self._tier_pointer is not None
         entry = record.raw
 
+        # Wall-clock pulse for idle-decay across ALL agents — any incoming
+        # event also advances time for dormant agents so they recover toward
+        # baseline without needing their own traffic. Decay knob lives in
+        # SPCParams.idle_decay_half_life_s (set to 0 to disable).
+        now = time.time()
+        self.registry.apply_idle_decay_all(now)
+
         agent_id = (entry.get("agent_id") or "<anon>").strip() or "<anon>"
         if agent_id == "<anon>":
             # Anonymous traffic isn't part of the multi-agent governance story;
@@ -187,7 +225,9 @@ class SentinelRuntime:
 
         verdict = judge(entry)
         state = self.registry.get_or_create(agent_id)
-        state.observe(verdict.violation)
+        # Decay was already applied via apply_idle_decay_all above; passing
+        # `now` here just keeps last_event_ts in sync for this state.
+        state.observe(verdict.violation, now=now)
 
         if verdict.violation:
             self.mode_log.remember_violation(str(entry.get("request_id") or ""))

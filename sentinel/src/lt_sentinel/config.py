@@ -65,6 +65,14 @@ class SPCParams:
     mu_dev: float = 0.05
     sigma_dev: float = 0.040  # ≈ √(0.05 * 0.95 / 30) = 0.0398
 
+    # Wall-clock seconds after which an idle agent's EWMA drifts halfway
+    # back to µ_dev. Prevents "dormant agent stuck in lockdown forever"
+    # (covered in DESIGN.md §11.2 footnote). Set to 0 to disable.
+    # Chosen so the demo's <5-minute event-driven dynamics dominate over
+    # idle decay, but a 1-hour dormant agent (~6 half-lives) is effectively
+    # reset to baseline. This is an engineering parameter, not literature.
+    idle_decay_half_life_s: float = 600.0
+
     @property
     def k_cusum(self) -> float:
         return self.k_cusum_sigma_mult * self.sigma_dev

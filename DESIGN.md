@@ -418,6 +418,7 @@ Router 即使被污染想绕过 HR 自己查 confidential DB，LT 在当前 poli
 - `τ_high` / `τ_low` 阈值**先占位**,等 dev 阶段跑基线数据后 calibrate
 - **升降档由 EWMA 自然衰减实现**,无需单独的恢复机制。攻击窗口结束后近 N 条正常请求会把 EWMA 拉回,档位自动升回信任
 - **戒严不等于 DENY 一切**:只是 LT 用更严格的 policy。被该 policy 命中 DENY 的请求是 policy 决定的,不是 Sentinel 直接拍
+- **dormant agent 不会卡死**(2026-05-15 23:59 补):一个被打进 lockdown 后无流量的 agent,EWMA 按 `idle_decay_half_life_s = 600s` 半衰期向 µ 漂移。事件驱动实现(`runtime._handle_record` 开头调 `registry.apply_idle_decay_all(now)`),不开后台协程;**任何其它 agent 来事件时,顺手把这个 agent 的时钟推到 now**。dt=10min → EWMA 减半;dt=1h → ≈ 完全回归 µ。CUSUM 不衰减(保留累积漂移信号是 §12.1 的语义)。`idle_decay_half_life_s=0` 可关闭
 
 **README 必须诚实写明**:"Sentinel 维护 per-identity 信任状态,policy 层切档当前是全局粒度,因为底层 LT 暂不支持 identity condition field。Per-identity policy 切档是未来扩展项(需 LT 扩展 condition fields 或起多 LT 实例)。"这本身就服务于 Track 1 "audit trails a regulator could read" 加分项。
 
@@ -566,6 +567,8 @@ Sentinel 写两类持久化 jsonl,**所有切档事件必须可追根溯源**(20
 
 **启动时 replay**(2026-05-15 实测落地,`SentinelRuntime._replay_in_memory_state()`):Sentinel 启动读 `sentinel_events.jsonl` 重建 in-memory 状态(OER 窗口 / EWMA / CUSUM),跳过 anon / egress 条目。replay 完成后调用 `_resolve_startup_tier()` 按 worst-case TrustScore 决定初始档位 — 崩溃前已经在 lockdown 的 Sentinel 重启后**仍然是 lockdown**,不会回退到 trust。Live tailer 在 `_SingleFileTail` 里 `seek(file.size)` 起步,replay 与 live 路径互不重叠。`tests/test_startup_replay.py` 5 个 case 锁定行为。无状态丢失。
 
+**replay × idle-decay 互动**:每条事件的 `ts` 字段被解析为墙钟秒后传给 `observe(now=ts)`,所以重放期间事件之间的真实时间间隔**自然产生衰减**。最后一条 event 的 ts 留在 `last_event_ts`,**第一条 live 事件的 `now=time.time()` 跟它的差**就是"宕机期间的衰减" — 一个昨晚被打进 lockdown 的 Sentinel 重启后,第一条事件就会把"宕机的几小时"全部计入恢复。这条没有专门测试,但 `test_observe_with_now_applies_decay_before_event` + `test_replay_round_trip_through_event_log` 组合上覆盖了两端。
+
 Track 1 加分项 "audit trails a regulator could read" 直接对齐。
 
 ### 11.7 可视化形态
@@ -622,6 +625,7 @@ Track 1 加分项 "audit trails a regulator could read" 直接对齐。
 | **h (CUSUM 决策限)** | **4σ** | Hawkins & Olwell 1998 标准表:k=0.5σ + h=4σ ⇒ ARL₀ ≈ 168;h=5σ ⇒ ARL₀ ≈ 465。入侵检测取 h=4σ 平衡敏感度与误报 | 套用:当 `S_t > h` 时判定漂移确认 |
 | **OER 滑动窗口 N** | **30** | Münz & Carle 2008, *Traffic Anomaly Detection Using Control Charts* — SYN flood 检测用 30–60 窗口;我们慢速注入剧本 5–10 步,N=30 足够覆盖 | 套用:OER 计算只用最近 30 条链 |
 | **ARL₀ 目标** | **~100** | SPC 入侵检测常用区间 50–200(Münz & Carle 2008);demo 取 100 = 平均 100 条干净链误报一次,戏剧性可接受 | 套用:校准完 λ/h 后回算 ARL₀,偏离 100±50% 重调 |
+| **`idle_decay_half_life_s`** | **600s (10 分钟)** | **非文献,工程参数**。修 dormant-agent 卡死 bug(详 §11.2 末尾)。10 min 大于 demo 5 min 时长,所以**不干扰事件驱动动力学**;1 hour dormant(6 half-lives)≈ 完全回归 µ | 公式:`EWMA_new = µ + (EWMA_old − µ)·0.5^(dt/half_life)`,只衰减 EWMA,CUSUM 不动(保留累积漂移信号)。`0` 关闭。 |
 
 ### 12.2 必须实测(2026-05-15 22:00 完成,跑 N=220 happy-path)
 

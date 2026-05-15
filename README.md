@@ -103,6 +103,13 @@ Three LT instances stay up the whole time. Sentinel never reloads LT, never modi
 
 The **agents process** is a single Python program running a LangGraph `StateGraph`: Router classifies user input and dispatches via a conditional edge to one of three workers; each worker has its own Chroma-backed retrieval tool and uses LangChain `bind_tools` so tool returns arrive as real `role:"tool"` messages. Scenario C additionally binds a deliberately compromised `fetch_external_calendar` tool to the IT worker.
 
+### Recovery & resilience
+
+Two mechanisms keep state honest under non-ideal conditions:
+
+* **Idle-decay** — an agent that's been pushed into Lockdown and then sees no traffic doesn't stay frozen at TrustScore = 0 forever. EWMA drifts halfway back toward µ_dev every `idle_decay_half_life_s` of wall-clock silence (default 600s). Event-driven, no background coroutine: any incoming audit record for *any* agent triggers `registry.apply_idle_decay_all(now)` so dormant agents catch up to current time. Demo timescale (~5 min) sits below half a half-life, so live dynamics dominate; a 1-hour dormant agent (~6 half-lives) is effectively reset to baseline. Disable by setting `idle_decay_half_life_s = 0` in `config.py`. (DESIGN.md §11.2 last bullet, §14.7.1)
+* **Startup replay** — on Sentinel start, `runtime._replay_in_memory_state()` reads `sentinel_events.jsonl` and replays every ingress event into the per-agent registry, using the event's own `ts` field as the wall-clock for idle-decay. Side effect: any wall-clock gap between crash and restart automatically counts toward recovery on the first live event after resume. A Sentinel that crashed mid-Lockdown comes back up at the right tier, not at trust=1. 5 unit tests pin this in `tests/test_startup_replay.py`. (DESIGN.md §11.6 last paragraph)
+
 ## Quickstart
 
 Prerequisites: Go 1.22+, Python 3.10+, Ollama with at least one OpenAI-compatible tool-calling model installed (we use `qwen2.5:7b`).
@@ -158,6 +165,8 @@ py -m scenarios.calibrate          # writes data/calibration_report.json
 | p-chart σ formula | √(μ(1−μ)/N) | Montgomery 2009, *Introduction to Statistical Quality Control* §7.2 |
 | TrustScore formula | clamp(1 − (EWMA − μ)/(3σ), 0, 1) | derived from SPC control limits ([`DESIGN.md`](DESIGN.md) §12.2.B) |
 | Baseline OER prior | μ = 0.05, σ = 0.040 | low end of Agent Security Bench (ICLR 2025) predicted range; measured μ = 0.0 on N=220 happy-path corroborates that violation judge rejects intent-classifier noise |
+| Tier thresholds | τ_high = 0.33, τ_low = 0.10 | locked in normalised TrustScore space — τ_high corresponds to EWMA = µ+2σ (SPC warning limit), τ_low ≈ µ+3σ with 0.10 anti-flap buffer; insensitive to numeric µ/σ |
+| Idle decay half-life | 600s (10 min) | engineering pick — sits above demo duration (~5 min, ~0.5 half-life, factor 0.71, doesn't interfere with live dynamics) and below a typical dormancy window (1 hour ≈ 6 half-lives, factor 0.016, effective reset). See [`DESIGN.md`](DESIGN.md) §14.7.1 for the comparison against 60s / 6000s alternatives. |
 
 Calibration script: `sentinel/scenarios/calibrate.py`. Full method: [`DESIGN.md`](DESIGN.md) §12.
 
@@ -209,7 +218,9 @@ lablab-techex-track1-lobstertrap/
     │   ├── attack_c_tool_poisoning.py
     │   ├── demo_run.py         canonical end-to-end demo
     │   └── visualize.py        matplotlib chart of trust_history + transitions
-    ├── tests/test_metrics.py   28 unit tests — math + judge regression
+    ├── tests/
+    │   ├── test_metrics.py     34 unit tests — SPC math + judge + idle-decay
+    │   └── test_startup_replay.py  5 unit tests — replay state-rebuild from sentinel_events.jsonl
     └── data/                   JSONL outputs + chart PNGs + canonical demo dataset
         ├── chroma_seed/        persisted Chroma database (HR / Finance / IT collections)
         └── demo_canonical/     canonical run dataset — gitted for reproducibility

@@ -83,6 +83,12 @@ def offline_arl0(events_path: Path, spc: SPCParams) -> tuple[int, int]:
 
 
 def main() -> None:
+    # Pull SPC defaults from runtime config (single source of truth) so
+    # `py -m scenarios.calibrate` with no args replays under the same
+    # parameters the live Sentinel runtime is using. Explicit CLI flags
+    # still override for offline what-if analyses.
+    cfg = default_config()
+
     parser = argparse.ArgumentParser(description="LT-Sentinel SPC calibration")
     parser.add_argument(
         "--events",
@@ -96,13 +102,12 @@ def main() -> None:
         default=None,
         help="Output JSON report path (default: data/calibration_report.json)",
     )
-    parser.add_argument("--lambda-ewma", type=float, default=0.2)
-    parser.add_argument("--k-sigma-mult", type=float, default=0.5)
-    parser.add_argument("--h-sigma-mult", type=float, default=4.0)
-    parser.add_argument("--window-size", type=int, default=30)
+    parser.add_argument("--lambda-ewma", type=float, default=cfg.spc.lambda_ewma)
+    parser.add_argument("--k-sigma-mult", type=float, default=cfg.spc.k_cusum_sigma_mult)
+    parser.add_argument("--h-sigma-mult", type=float, default=cfg.spc.h_cusum_sigma_mult)
+    parser.add_argument("--window-size", type=int, default=cfg.spc.window_size)
     args = parser.parse_args()
 
-    cfg = default_config()
     events_path = args.events or cfg.sentinel_events_path
     report_path = args.report or (cfg.project_root / cfg.data_dir / "calibration_report.json")
 

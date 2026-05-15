@@ -1073,25 +1073,25 @@ judge 规则:`risk_score ≥ 0.40 AND ≥1 critical/warning mismatch` → violat
 | Scenario 默认 `n_warm=20`(attack B) | 20 | 攻击前热身 20 turns 让 EWMA 稳到 baseline,够代表"信任建立" |
 | Happy-path 默认 `n=80` | 80 | demo 时间内能跑完(80 / 2qps = 40s),又能产生 ~240 events 让 SPC 统计有意义 |
 
-### 14.9 已知不一致
+### 14.9 已知不一致 — 历史 + 修复记录
 
-诚实列出 — 不修不藏。
+**14.9.1 `calibrate.py` 的 SPC CLI 默认 vs runtime 默认**(commit `b9b40c8` 写,**commit `<next>` 修**)
 
-**14.9.1 `calibrate.py` 的 `--lambda-ewma` CLI default = 0.2,但 runtime `config.py:lambda_ewma = 0.05`**
+**问题**:`scenarios/calibrate.py` 4 个 SPC CLI 参数硬编码了文献值,runtime 的 `config.py:SPCParams` 在 λ tuning 后(commit `54368d4`)改成 0.05。结果:`py -m scenarios.calibrate` 无参跑时用 λ=0.2 做 offline replay,**报告的 ARL₀ 不反映 runtime 行为**。
 
-**位置**:
-- `sentinel/scenarios/calibrate.py:99`: `parser.add_argument("--lambda-ewma", type=float, default=0.2)`
-- `sentinel/src/lt_sentinel/config.py:54`: `lambda_ewma: float = 0.05`
+**根因**:calibrate.py 重复了配置 — 它本应该是 `SPCParams` 的下游消费者,却硬编码了一份独立默认值。tune 后没同步。
 
-**原因**:`calibrate.py` 写在 λ tuning 之前(commit `3dbf78e`),CLI default 留的是 Lucas & Saccucci 1990 中位值 0.2。tuning 后(commit `54368d4` 之前)runtime 改成 0.05,calibrate 的 CLI default 没同步。
+**修复**:让 `argparse` 默认从 `default_config().spc` 读,单一真相源。2 行改动:
+```python
+cfg = default_config()
+parser.add_argument("--lambda-ewma", type=float, default=cfg.spc.lambda_ewma)
+# (3 others same pattern)
+```
+显式 CLI 参数仍可 override 用于 offline what-if 分析。
 
-**影响**:`py -m scenarios.calibrate` 无参跑时,offline replay 用 λ=0.2,跟实际 runtime 行为不一致。**`calibration_report.json` 里的 ARL₀ 数字是用 λ=0.2 算的,不是 runtime 用的 λ=0.05**。
+**当初为什么没立刻修(诚实反思)**:本文档第一版我写"暴露给读者比偷偷改要诚实",当时把"在 §14.9 写一段"当成了等效的修复。这是用文档当借口。文档不是 bug 的替代品 — 修了 + git log 留痕,比留段 markdown 更诚实。
 
-**当前缓解**:`py -m scenarios.calibrate --lambda-ewma 0.05` 可手动对齐。
-
-**正确修法**(2 行改动,scope 之内,我没做):让 calibrate.py 从 `SentinelConfig.default_config().spc.lambda_ewma` 读默认,而非硬编码 0.2。
-
-**为什么留着写在这**:暴露给读者比偷偷改要诚实。日后清理可以 1 个 commit 修掉,文档里这一条作为 known-issue 历史记录。
+**这一条保留在 §14.9 不删**:作为"写文档 ≠ 修代码"教训的历史记录。git log 显示完整的"引入 → 文档化 → 修复"链。
 
 ### 14.10 Demo 观察值(canonical run 输出)
 

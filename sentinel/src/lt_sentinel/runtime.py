@@ -1,0 +1,244 @@
+"""The wired-up runtime: supervisor + proxy + tail + metrics + audit writers.
+
+This is what `lt-sentinel run` invokes. Two coroutines run concurrently:
+
+    1. proxy task  — handles incoming agent requests, forwarding to current tier
+    2. monitor task — tails LT audit logs, updates per-agent metrics, swaps tier
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .audit_writers import ModeChangeLog, SentinelEventLog, TrustHistoryLog
+from .config import SentinelConfig, TIER_TRUST
+from .log_tail import AuditRecord, MultiFileTail
+from .metrics import AgentRegistry
+from .proxy import TierAwareProxy
+from .supervisor import LTSupervisor
+from .tier_state import decide_tier, transition_reason
+from .violation import judge
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _AtomicTierPort:
+    """Thread-safe pointer holding the upstream port for the current tier."""
+
+    port: int
+    tier: str = TIER_TRUST
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def get_port(self) -> int:
+        with self._lock:
+            return self.port
+
+    def set(self, tier: str, port: int) -> None:
+        with self._lock:
+            self.tier = tier
+            self.port = port
+
+
+class SentinelRuntime:
+    def __init__(self, config: SentinelConfig) -> None:
+        self.config = config
+        self.supervisor = LTSupervisor(config=config)
+        self.registry = AgentRegistry(spc=config.spc)
+        self.events_log = SentinelEventLog(config.sentinel_events_path)
+        self.mode_log = ModeChangeLog(config.mode_changes_path)
+        self.trust_log = TrustHistoryLog(config.trust_history_path)
+        self._tier_pointer: _AtomicTierPort | None = None
+        self.proxy: TierAwareProxy | None = None
+        self._stop = asyncio.Event()
+
+    async def start(self) -> None:
+        await self.supervisor.start_all()
+
+        initial_port = self.supervisor.port_for(TIER_TRUST)
+        self._tier_pointer = _AtomicTierPort(port=initial_port, tier=TIER_TRUST)
+
+        host, _, port = self.config.sentinel_listen.partition(":")
+        self.proxy = TierAwareProxy(
+            listen_host=host,
+            listen_port=int(port),
+            get_upstream_port=self._tier_pointer.get_port,
+        )
+        await self.proxy.start()
+
+        # Seed mode-change log with initial tier so reasoning is replayable.
+        self.mode_log.emit(
+            from_tier="<init>",
+            to_tier=TIER_TRUST,
+            trigger_agent="<init>",
+            trigger_trust_score=1.0,
+            threshold_crossed="<init>",
+            all_agents_trust_snapshot={},
+            policy_yaml_applied="policy_trust.yaml",
+            reason_summary="Sentinel started; default tier=trust",
+        )
+
+    async def run_forever(self) -> None:
+        monitor_task = asyncio.create_task(self._monitor_loop(), name="monitor")
+        stop_waiter = asyncio.create_task(self._stop.wait(), name="stop-waiter")
+        try:
+            await asyncio.wait(
+                {monitor_task, stop_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            monitor_task.cancel()
+            stop_waiter.cancel()
+            for t in (monitor_task, stop_waiter):
+                with suppress(asyncio.CancelledError, Exception):
+                    await t
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    async def stop(self) -> None:
+        self.request_stop()
+        if self.proxy is not None:
+            await self.proxy.stop()
+        await self.supervisor.stop_all()
+        self.events_log.close()
+        self.mode_log.close()
+        self.trust_log.close()
+
+    # ---- monitor loop ------------------------------------------------------
+
+    async def _monitor_loop(self) -> None:
+        tail = MultiFileTail(
+            files={
+                tier: binding.audit_log_path
+                for tier, binding in self.config.tier_bindings.items()
+            }
+        )
+        async for record in tail.stream():
+            try:
+                self._handle_record(record)
+            except Exception:
+                logger.exception("error handling audit record: %s", record)
+
+    def _handle_record(self, record: AuditRecord) -> None:
+        assert self._tier_pointer is not None
+        entry = record.raw
+
+        agent_id = (entry.get("agent_id") or "<anon>").strip() or "<anon>"
+        if agent_id == "<anon>":
+            # Anonymous traffic isn't part of the multi-agent governance story;
+            # we still count it in event log but exclude from per-identity OER.
+            self._emit_event(entry, record, registry_state=None, violation_v=None)
+            return
+
+        verdict = judge(entry)
+        state = self.registry.get_or_create(agent_id)
+        state.observe(verdict.violation)
+
+        if verdict.violation:
+            self.mode_log.remember_violation(str(entry.get("request_id") or ""))
+
+        # Tier decision is based on global worst-case TrustScore.
+        _, min_trust = self.registry.min_trust()
+        new_tier = decide_tier(min_trust, self.config.spc)
+        if new_tier != self._tier_pointer.tier:
+            self._switch_tier(
+                new_tier=new_tier,
+                trigger_agent=agent_id,
+                trigger_trust=state.trust_score,
+            )
+
+        self._emit_event(entry, record, registry_state=state, violation_v=verdict)
+        self.trust_log.emit(
+            ts=str(entry.get("timestamp") or ""),
+            agent_id=agent_id,
+            trust_score=state.trust_score,
+            ewma=state.ewma,
+            cusum=state.cusum,
+            tier=self._tier_pointer.tier,
+        )
+
+    def _switch_tier(self, *, new_tier: str, trigger_agent: str, trigger_trust: float) -> None:
+        assert self._tier_pointer is not None
+        prev_tier = self._tier_pointer.tier
+        new_port = self.supervisor.port_for(new_tier)
+        threshold = transition_reason(prev_tier, new_tier, self.config.spc) or "<unknown>"
+
+        self._tier_pointer.set(tier=new_tier, port=new_port)
+        logger.info(
+            "tier swap %s → %s (triggered by %s, trust=%.3f, port=:%d)",
+            prev_tier,
+            new_tier,
+            trigger_agent,
+            trigger_trust,
+            new_port,
+        )
+
+        self.mode_log.emit(
+            from_tier=prev_tier,
+            to_tier=new_tier,
+            trigger_agent=trigger_agent,
+            trigger_trust_score=trigger_trust,
+            threshold_crossed=threshold,
+            all_agents_trust_snapshot=self.registry.trust_snapshot(),
+            policy_yaml_applied=f"policy_{new_tier}.yaml",
+            reason_summary=(
+                f"{trigger_agent} TrustScore={trigger_trust:.3f} "
+                f"crossed {threshold}; transitioning {prev_tier} → {new_tier}"
+            ),
+        )
+
+    def _emit_event(
+        self,
+        entry: dict[str, Any],
+        record: AuditRecord,
+        *,
+        registry_state,
+        violation_v,
+    ) -> None:
+        assert self._tier_pointer is not None
+
+        metadata = entry.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        mismatches = entry.get("mismatches") or []
+
+        def _count_severity(level: str) -> int:
+            return sum(
+                1
+                for m in mismatches
+                if isinstance(m, dict) and str(m.get("severity", "")).lower() == level
+            )
+
+        snap = registry_state.snapshot() if registry_state is not None else {
+            "oer": 0.0,
+            "ewma": 0.0,
+            "cusum": 0.0,
+            "trust_score": 1.0,
+        }
+
+        self.events_log.emit(
+            ts=str(entry.get("timestamp") or ""),
+            request_id=str(entry.get("request_id") or ""),
+            agent_id=str(entry.get("agent_id") or "<anon>"),
+            direction=str(entry.get("direction") or ""),
+            lt_action=str(entry.get("action") or ""),
+            lt_rule=str(entry.get("rule_name") or ""),
+            lt_risk_score=float(metadata.get("risk_score") or 0.0),
+            lt_mismatches_critical=_count_severity("critical"),
+            lt_mismatches_warning=_count_severity("warning"),
+            violation=bool(violation_v.violation) if violation_v else False,
+            violation_reasons=tuple(violation_v.reasons) if violation_v else (),
+            oer_after=snap["oer"],
+            ewma_oer_after=snap["ewma"],
+            cusum_after=snap["cusum"],
+            trust_score_after=snap["trust_score"],
+            current_tier_global=self._tier_pointer.tier,
+            source_tier_logfile=record.source,
+        )

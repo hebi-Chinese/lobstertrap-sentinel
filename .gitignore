@@ -1,0 +1,51 @@
+# Build outputs
+lobstertrap/lobstertrap.exe
+lobstertrap/lobstertrap
+lobstertrap/*.test
+
+# Runtime data
+sentinel/data/*.jsonl
+sentinel/data/*.png
+sentinel/data/calibration_report.json
+!sentinel/data/demo_canonical/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Notes (kept locally, not for repo)
+.claude/
+
+# Hackathon early notes (already represented in DESIGN.md)
+# Keeping them tracked, just ignoring autosave junk:
+*.bak
+
+# LT-Sentinel local logs
+*.log

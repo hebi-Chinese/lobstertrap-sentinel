@@ -1,0 +1,201 @@
+version: "1.0"
+policy_name: "lt-sentinel-observe"
+# Observe tier — Sentinel sees some agent's TrustScore ∈ [τ_low=0.10, τ_high=0.33].
+# Heighten inspection: lower thresholds, add role-impersonation & PII-request blocks,
+# tighten rate limits. Default still ALLOW; HUMAN_REVIEW more aggressively.
+
+default_action: ALLOW
+
+ingress_rules:
+  - name: block_prompt_injection
+    description: "Detected prompt injection attempt"
+    priority: 100
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: prompt injection detected."
+    conditions:
+      - field: contains_injection_patterns
+        match_type: boolean
+        value: true
+
+  - name: block_harm_violence
+    description: "Prompt requests instructions for violence or harmful substances"
+    priority: 98
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: harmful content request."
+    conditions:
+      - field: contains_harm_patterns
+        match_type: boolean
+        value: true
+
+  - name: block_malware_request
+    description: "Prompt requests creation of malware or exploits"
+    priority: 96
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: malware/exploit generation request."
+    conditions:
+      - field: contains_malware_request
+        match_type: boolean
+        value: true
+
+  - name: block_phishing_fraud
+    description: "Prompt requests creation of phishing content"
+    priority: 94
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: phishing/fraud content request."
+    conditions:
+      - field: contains_phishing_patterns
+        match_type: boolean
+        value: true
+
+  - name: block_data_exfiltration
+    description: "Prompt contains data exfiltration patterns"
+    priority: 92
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: data exfiltration attempt."
+    conditions:
+      - field: contains_exfiltration
+        match_type: boolean
+        value: true
+
+  - name: block_obfuscation_evasion
+    description: "Prompt uses encoding or obfuscation to evade detection"
+    priority: 90
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: obfuscation/evasion technique."
+    conditions:
+      - field: contains_obfuscation
+        match_type: boolean
+        value: true
+
+  - name: review_role_impersonation
+    description: "Prompt attempts privileged role identity"
+    priority: 86
+    action: HUMAN_REVIEW
+    conditions:
+      - field: contains_role_impersonation
+        match_type: boolean
+        value: true
+
+  - name: block_sensitive_paths
+    description: "Prompt targets sensitive system paths"
+    priority: 85
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: sensitive path access denied."
+    conditions:
+      - field: contains_sensitive_paths
+        match_type: boolean
+        value: true
+
+  - name: block_pii_request
+    description: "Prompt requests personal/sensitive information"
+    priority: 82
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: PII request denied."
+    conditions:
+      - field: contains_pii_request
+        match_type: boolean
+        value: true
+
+  - name: block_dangerous_commands
+    description: "Dangerous system commands with elevated risk"
+    priority: 80
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Blocked: dangerous command."
+    conditions:
+      - field: contains_system_commands
+        match_type: boolean
+        value: true
+      - field: risk_score
+        match_type: threshold
+        value: 0.2
+
+  - name: review_medium_high_risk
+    description: "Medium-high risk score requires human review (Observe threshold 0.5)"
+    priority: 70
+    action: HUMAN_REVIEW
+    conditions:
+      - field: risk_score
+        match_type: threshold
+        value: 0.5
+
+  - name: log_code_execution
+    description: "Log code execution requests"
+    priority: 30
+    action: LOG
+    conditions:
+      - field: intent_category
+        match_type: exact
+        value: "code_execution"
+
+  - name: log_credential_access
+    description: "Log credential-access intent for observability"
+    priority: 28
+    action: LOG
+    conditions:
+      - field: intent_category
+        match_type: exact
+        value: "credential_access"
+
+egress_rules:
+  - name: block_credential_leak
+    description: "Model output contains credentials"
+    priority: 100
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Output blocked: contains credentials."
+    conditions:
+      - field: contains_credentials
+        match_type: boolean
+        value: true
+
+  - name: block_pii_leak
+    description: "Model output contains PII"
+    priority: 90
+    action: DENY
+    deny_message: "[LT-Sentinel/Observe] Output blocked: contains PII."
+    conditions:
+      - field: contains_pii
+        match_type: boolean
+        value: true
+
+  - name: log_high_risk_output
+    description: "Log high risk model output (Observe threshold 0.5)"
+    priority: 50
+    action: LOG
+    conditions:
+      - field: risk_score
+        match_type: threshold
+        value: 0.5
+
+rate_limits:
+  requests_per_minute: 120
+  requests_per_hour: 2000
+  burst_threshold: 30
+
+network:
+  egress_policy: allowlist
+  allowed_domains:
+    - "api.openai.com"
+    - "api.anthropic.com"
+    - "localhost"
+  denied_domains:
+    - "*.onion"
+    - "pastebin.com"
+    - "*.tk"
+    - "*.ml"
+
+filesystem:
+  denied_paths:
+    - "/etc/**"
+    - "/root/**"
+    - "/var/**"
+    - "**/.ssh/**"
+    - "**/.env"
+    - "**/*secret*"
+    - "**/*password*"
+    - "**/credentials*"
+  allowed_read_paths:
+    - "/home/*/documents/**"
+    - "/tmp/agent_workspace/**"
+  allowed_write_paths:
+    - "/home/*/documents/agent_output/**"
+    - "/tmp/agent_workspace/**"

@@ -1,0 +1,118 @@
+version: "1.0"
+policy_name: "lt-sentinel-trust"
+# Trust tier — Sentinel sees all agents at TrustScore > τ_high (0.33).
+# Only block clear-cut single-event attacks; default ALLOW.
+# This is essentially LT's default policy minus a few near-baseline checks
+# (we let mild-risk traffic through so EWMA can establish μ_dev).
+
+default_action: ALLOW
+
+ingress_rules:
+  - name: block_prompt_injection
+    description: "Detected prompt injection attempt"
+    priority: 100
+    action: DENY
+    deny_message: "[LT-Sentinel/Trust] Blocked: prompt injection detected."
+    conditions:
+      - field: contains_injection_patterns
+        match_type: boolean
+        value: true
+
+  - name: block_harm_violence
+    description: "Prompt requests instructions for violence or harmful substances"
+    priority: 98
+    action: DENY
+    deny_message: "[LT-Sentinel/Trust] Blocked: harmful content request."
+    conditions:
+      - field: contains_harm_patterns
+        match_type: boolean
+        value: true
+
+  - name: block_malware_request
+    description: "Prompt requests creation of malware or exploits"
+    priority: 96
+    action: DENY
+    deny_message: "[LT-Sentinel/Trust] Blocked: malware/exploit generation request."
+    conditions:
+      - field: contains_malware_request
+        match_type: boolean
+        value: true
+
+  - name: block_data_exfiltration
+    description: "Prompt contains explicit data exfiltration patterns"
+    priority: 92
+    action: DENY
+    deny_message: "[LT-Sentinel/Trust] Blocked: data exfiltration attempt."
+    conditions:
+      - field: contains_exfiltration
+        match_type: boolean
+        value: true
+
+  - name: review_high_risk
+    description: "High risk score requires human review (Trust threshold 0.85)"
+    priority: 70
+    action: HUMAN_REVIEW
+    conditions:
+      - field: risk_score
+        match_type: threshold
+        value: 0.85
+
+  - name: log_code_execution
+    description: "Log code execution requests"
+    priority: 30
+    action: LOG
+    conditions:
+      - field: intent_category
+        match_type: exact
+        value: "code_execution"
+
+egress_rules:
+  - name: block_credential_leak
+    description: "Model output contains credentials"
+    priority: 100
+    action: DENY
+    deny_message: "[LT-Sentinel/Trust] Output blocked: contains credentials."
+    conditions:
+      - field: contains_credentials
+        match_type: boolean
+        value: true
+
+  - name: block_pii_leak
+    description: "Model output contains PII"
+    priority: 90
+    action: DENY
+    deny_message: "[LT-Sentinel/Trust] Output blocked: contains PII."
+    conditions:
+      - field: contains_pii
+        match_type: boolean
+        value: true
+
+rate_limits:
+  requests_per_minute: 240
+  requests_per_hour: 4000
+  burst_threshold: 60
+
+network:
+  egress_policy: allowlist
+  allowed_domains:
+    - "api.openai.com"
+    - "api.anthropic.com"
+    - "localhost"
+  denied_domains:
+    - "*.onion"
+    - "pastebin.com"
+
+filesystem:
+  denied_paths:
+    - "/etc/**"
+    - "/root/**"
+    - "**/.ssh/**"
+    - "**/.env"
+    - "**/*secret*"
+    - "**/*password*"
+  allowed_read_paths:
+    - "/home/*/documents/**"
+    - "/tmp/agent_workspace/**"
+  allowed_write_paths:
+    - "/home/*/documents/agent_output/**"
+    - "/tmp/agent_workspace/**"

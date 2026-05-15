@@ -1,0 +1,223 @@
+version: "1.0"
+policy_name: "lt-sentinel-lockdown"
+# Lockdown tier — Sentinel sees some agent's TrustScore < τ_low (0.10).
+# Aggressively QUARANTINE / HUMAN_REVIEW; treat any non-trivial risk as suspect.
+# This is NOT "DENY everything" — it's "trust nothing without scrutiny".
+# Default action stays ALLOW so plain greetings still pass; everything risky escalates.
+
+default_action: ALLOW
+
+ingress_rules:
+  - name: block_prompt_injection
+    description: "Detected prompt injection attempt"
+    priority: 100
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: prompt injection detected."
+    conditions:
+      - field: contains_injection_patterns
+        match_type: boolean
+        value: true
+
+  - name: block_harm_violence
+    description: "Prompt requests instructions for violence or harmful substances"
+    priority: 98
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: harmful content request."
+    conditions:
+      - field: contains_harm_patterns
+        match_type: boolean
+        value: true
+
+  - name: block_malware_request
+    description: "Prompt requests creation of malware or exploits"
+    priority: 96
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: malware/exploit request."
+    conditions:
+      - field: contains_malware_request
+        match_type: boolean
+        value: true
+
+  - name: block_phishing_fraud
+    description: "Prompt requests creation of phishing content"
+    priority: 94
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: phishing/fraud request."
+    conditions:
+      - field: contains_phishing_patterns
+        match_type: boolean
+        value: true
+
+  - name: quarantine_data_exfiltration
+    description: "Any exfiltration pattern is quarantined for forensics"
+    priority: 92
+    action: QUARANTINE
+    deny_message: "[LT-Sentinel/Lockdown] Quarantined: data exfiltration pattern."
+    conditions:
+      - field: contains_exfiltration
+        match_type: boolean
+        value: true
+
+  - name: block_obfuscation_evasion
+    description: "Obfuscation / evasion is blocked"
+    priority: 90
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: obfuscation/evasion technique."
+    conditions:
+      - field: contains_obfuscation
+        match_type: boolean
+        value: true
+
+  - name: quarantine_role_impersonation
+    description: "Role-impersonation under lockdown is quarantined"
+    priority: 86
+    action: QUARANTINE
+    deny_message: "[LT-Sentinel/Lockdown] Quarantined: role impersonation under lockdown."
+    conditions:
+      - field: contains_role_impersonation
+        match_type: boolean
+        value: true
+
+  - name: block_sensitive_paths
+    description: "Prompt targets sensitive system paths"
+    priority: 85
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: sensitive path access."
+    conditions:
+      - field: contains_sensitive_paths
+        match_type: boolean
+        value: true
+
+  - name: block_pii_request
+    description: "Prompt requests personal/sensitive information"
+    priority: 82
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: PII request."
+    conditions:
+      - field: contains_pii_request
+        match_type: boolean
+        value: true
+
+  - name: block_dangerous_commands
+    description: "Dangerous system commands are blocked at low threshold"
+    priority: 80
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Blocked: dangerous command."
+    conditions:
+      - field: contains_system_commands
+        match_type: boolean
+        value: true
+      - field: risk_score
+        match_type: threshold
+        value: 0.1
+
+  - name: review_any_credential_intent
+    description: "Any credential-access intent goes to human review under lockdown"
+    priority: 75
+    action: HUMAN_REVIEW
+    conditions:
+      - field: intent_category
+        match_type: exact
+        value: "credential_access"
+
+  - name: review_any_data_access_intent
+    description: "Any data-access intent goes to human review under lockdown"
+    priority: 74
+    action: HUMAN_REVIEW
+    conditions:
+      - field: intent_category
+        match_type: exact
+        value: "data_access"
+
+  - name: review_low_threshold_risk
+    description: "Any non-trivial risk score requires review (Lockdown threshold 0.2)"
+    priority: 70
+    action: HUMAN_REVIEW
+    conditions:
+      - field: risk_score
+        match_type: threshold
+        value: 0.2
+
+  - name: review_code_execution
+    description: "Code execution intent requires review under lockdown"
+    priority: 60
+    action: HUMAN_REVIEW
+    conditions:
+      - field: intent_category
+        match_type: exact
+        value: "code_execution"
+
+egress_rules:
+  - name: block_credential_leak
+    description: "Model output contains credentials"
+    priority: 100
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Output blocked: contains credentials."
+    conditions:
+      - field: contains_credentials
+        match_type: boolean
+        value: true
+
+  - name: block_pii_leak
+    description: "Model output contains PII"
+    priority: 90
+    action: DENY
+    deny_message: "[LT-Sentinel/Lockdown] Output blocked: contains PII."
+    conditions:
+      - field: contains_pii
+        match_type: boolean
+        value: true
+
+  - name: quarantine_high_risk_output
+    description: "High-risk output is quarantined under lockdown"
+    priority: 70
+    action: QUARANTINE
+    deny_message: "[LT-Sentinel/Lockdown] Output quarantined: high risk."
+    conditions:
+      - field: risk_score
+        match_type: threshold
+        value: 0.3
+
+  - name: log_any_output
+    description: "Log every output under lockdown for forensic review"
+    priority: 10
+    action: LOG
+    conditions:
+      - field: token_count
+        match_type: threshold
+        value: 1
+
+rate_limits:
+  requests_per_minute: 30
+  requests_per_hour: 500
+  burst_threshold: 5
+
+network:
+  egress_policy: allowlist
+  allowed_domains:
+    - "localhost"
+  denied_domains:
+    - "*.onion"
+    - "pastebin.com"
+    - "*.tk"
+    - "*.ml"
+    - "*.ga"
+    - "*.cf"
+
+filesystem:
+  denied_paths:
+    - "/etc/**"
+    - "/root/**"
+    - "/var/**"
+    - "/usr/**"
+    - "**/.ssh/**"
+    - "**/.env*"
+    - "**/*secret*"
+    - "**/*password*"
+    - "**/credentials*"
+    - "**/*.key"
+    - "**/*.pem"
+  allowed_read_paths:
+    - "/tmp/agent_workspace/**"
+  allowed_write_paths:
+    - "/tmp/agent_workspace/**"

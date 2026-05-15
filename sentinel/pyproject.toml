@@ -1,0 +1,36 @@
+[project]
+name = "lt-sentinel"
+version = "0.1.0"
+description = "LT-Sentinel: cross-event statistical monitoring layer on top of Veea Lobster Trap (OER / EWMA / CUSUM)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "LT-Sentinel" }]
+license = { text = "MIT" }
+dependencies = [
+    "aiohttp>=3.9",
+    "pyyaml>=6.0",
+    "click>=8.1",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.8",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+lt-sentinel = "lt_sentinel.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lt_sentinel = ["py.typed"]

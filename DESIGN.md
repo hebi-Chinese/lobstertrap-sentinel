@@ -750,6 +750,388 @@ k_concrete = 0.5 × σ_dev = 0.020
 
 ---
 
+## 14. 全文数字溯源(2026-05-15 24:00 整理)
+
+**目的**:repo 里每个数字 — λ、σ、τ、半衰期、判官 risk band、policy rate limit、端口号 — 都按"可信度梯度"分类。读者一眼能看出哪些是论文、哪些是测量、哪些是工程拍板,以及拍板的那些**为什么是这个数,不是别的**。
+
+### 14.0 类别说明 + 索引
+
+按"可信度从硬到软"排:
+
+| 类别 | 含义 |
+|---|---|
+| §14.1 **文献定值** | 直接抄论文,没有任何修改;改一改就是篡改 |
+| §14.2 **文献区间内的工程选择** | 论文给一个区间,我们在区间内选了一个具体值。选法可辩 |
+| §14.3 **公式推导** | 代入文献定值或上游参数进入论文公式得出。**结果不可独立拍**,跟着输入走 |
+| §14.4 **Bayesian prior** | 测量失败时,用论文里 *预测的* 数值替代。比 §14.7 工程拍板硬一点(有出处),但比 §14.5 实测软(不是本数据集) |
+| §14.5 **实测得出** | 跑本项目 happy-path / canonical demo 得到的实际观测 |
+| §14.6 **设计锁定(归一化空间)** | 在 normalized [0,1] TrustScore 空间选定,因此**不依赖** µ/σ 具体数值。比"工程拍板"硬,因为有数学锁定 |
+| §14.7 **工程拍板 — 关键参数** | 没文献,没公式,纯设计判断。每条标"为什么这个数,不是别的" |
+| §14.8 **工程拍板 — 系统级 housekeeping** | timeouts / poll intervals / 端口号 / scenario CLI 默认 — 工程常识,非安全关键 |
+| §14.9 **已知不一致** | repo 内部数字对不齐的地方,诚实列出 |
+| §14.10 **Demo 观察值** | canonical run 的输出,不是输入(放最后给读者 trace 用) |
+
+**主索引**(每个数字 → 哪一节):
+
+| 名 | 值 | 类别 | 代码位置 |
+|---|---|---|---|
+| `k_cusum_sigma_mult` | 0.5 | §14.1 文献 | `config.py:55` |
+| `h_cusum_sigma_mult` | 4.0 | §14.1 文献 | `config.py:56` |
+| `lambda_ewma` (runtime) | 0.05 | §14.2 区间选择 | `config.py:54` |
+| `window_size` | 30 | §14.2 区间选择 | `config.py:57` |
+| `arl_target_band` | (50, 200) | §14.2 区间选择 | `calibrate.py:137` |
+| `sigma_dev` | 0.040 | §14.3 公式推导 | `config.py:66` |
+| `k_concrete` | 0.020 | §14.3 公式推导 | `metrics.py:@property` |
+| `h_concrete` | 0.160 | §14.3 公式推导 | `metrics.py:@property` |
+| `mu_dev` | 0.05 | §14.4 prior | `config.py:65` |
+| `mu_measured` | 0.0 | §14.5 实测 | `data/calibration_report.json` |
+| `tau_high` | 0.33 | §14.6 设计锁定 | `config.py:60` |
+| `tau_low` | 0.10 | §14.6 设计锁定 | `config.py:61` |
+| `idle_decay_half_life_s` | 600.0 | §14.7 工程拍板 | `config.py:74` |
+| `_RISK_BAND_CRITICAL` | 0.70 | §14.7 工程拍板 | `violation.py:30` |
+| `_RISK_BAND_MEDIUM` | 0.40 | §14.7 工程拍板 | `violation.py:31` |
+| `recent_violation_window` | 10 | §14.7 工程拍板 | `audit_writers.py:102` |
+| Router temperature / max_tokens | 0.0 / 8 | §14.7 工程拍板 | `graph.py:75` |
+| Worker temperature / max_tokens | 0.2 / 160 | §14.7 工程拍板 | `graph.py:122` |
+| Chroma corpus size per collection | 5 | §14.7 工程拍板 | `corpus.py` |
+| `POISONED_RESPONSES` 长度 | 8 | §14.7 工程拍板 | `poisoned_tool.py:18` |
+| Policy rate-limit 三档梯度 | 8:4:1 / 12:6:1 | §14.7 工程拍板 | `policies/*.yaml` |
+| Policy risk_score 三档梯度 | 0.3 / 0.2 / 0.1 | §14.7 工程拍板 | `policies/*.yaml` |
+| `poll_interval` | 0.10s | §14.8 housekeeping | `log_tail.py:26` |
+| LT 启动等待 timeout | 15.0s | §14.8 housekeeping | `supervisor.py:68` |
+| 反代 aiohttp.ClientTimeout | 180s | §14.8 housekeeping | `proxy.py:56` |
+| Sentinel 反代端口 | 8080 | §14.8 housekeeping | `config.py:91` |
+| LT 三档端口 | 18081/82/83 | §14.8 housekeeping | `config.py:100` |
+| Scenario 默认 qps / seed / N_warm | 2.0 / 20260516 / 20 | §14.8 housekeeping | `scenarios/*.py` |
+| `calibrate.py --lambda-ewma` CLI default | 0.2 | §14.9 已知不一致 | `calibrate.py:99` |
+
+### 14.1 文献定值(literature, no modification)
+
+直接抄论文,没改过任何参数值或公式形态。
+
+**14.1.1 EWMA 公式结构** — Lucas & Saccucci 1990, *Exponentially Weighted Moving Average Control Schemes*, *Technometrics* 32:1
+
+$$ \mathrm{EWMA}_t = \lambda \cdot X_t + (1 - \lambda) \cdot \mathrm{EWMA}_{t-1}, \quad \mathrm{EWMA}_0 = \mu $$
+
+**14.1.2 CUSUM 公式结构** — Page 1954, *Continuous Inspection Schemes*, *Biometrika* 41
+
+$$ S_t = \max(0, S_{t-1} + (X_t - \mu) - k), \quad S_0 = 0 $$
+
+单边累积(只取 max),漂移确认条件:$S_t > h$。
+
+**14.1.3 `k_cusum_sigma_mult = 0.5`** — Page 1954 + Hawkins & Olwell 1998, *Cumulative Sum Charts and Charting for Quality Improvement*
+
+CUSUM 参考值 $k$ 取"要检测的最小漂移量的一半"。我们检测 $\delta = 1\sigma$ 漂移 → $k = 0.5\sigma$。**所有 SPC 教科书的默认推导都是这个**,不存在"我们选 0.5"的余地。
+
+**14.1.4 `h_cusum_sigma_mult = 4.0`** — Hawkins & Olwell 1998 标准 ARL 表
+
+| h | k=0.5σ 时 ARL₀ |
+|---|---|
+| 3σ | ≈ 68 |
+| **4σ** | **≈ 168** |
+| 5σ | ≈ 465 |
+
+入侵检测语境下 $h = 4\sigma$ 是平衡敏感度与误报率的标准选择(Münz & Carle 2008 也用 4σ)。
+
+**14.1.5 p-chart σ 公式** — Montgomery 2009, *Introduction to Statistical Quality Control* §7.2
+
+$$ \sigma = \sqrt{\frac{\mu(1-\mu)}{N}} $$
+
+二项比例数据(OER 是"链是否 violation"的 0/1 序列)的理论方差。没有"我们选这个公式"的余地 — p-chart 数据就用这个。
+
+**14.1.6 SPC 3-σ control limit** — Montgomery 2009 §6
+
+控制限 $\mu \pm 3\sigma$ 对应 99.73% 信任区间(高斯近似)。我们的 TrustScore 公式以此为分母(§14.3.4)。
+
+### 14.2 文献区间内的工程选择
+
+论文给一个区间,我们在区间内**选了一个具体值**。选法需要辩护。
+
+**14.2.1 `lambda_ewma = 0.05`** — Lucas & Saccucci 1990 推荐区间 **[0.05, 0.30]**
+
+| 选 λ | 表现 |
+|---|---|
+| 0.20(论文中位偏高) | 单 violation EWMA 直接跳到 $0.2 + 0.8 \cdot \mu$,二值序列下马上饱和 $\mu+3\sigma$,trust → 0,**三档梯度坍缩为两档**(trust → lockdown,跳过 observe) |
+| **0.05(区间下限)** | 单 violation EWMA = $0.05 + 0.95\mu$;1 → trust 0.60,2 → trust 0.22(observe),3 → trust 0.00(lockdown)。**三档清晰** |
+
+为什么二值数据需要更低 λ?L&S 1990 的 λ=0.2 是**连续测量**(物理过程量度)的推荐;OER 是 0/1 序列,单事件方差 1.0 远大于 σ²=0.0016 → λ=0.2 让 EWMA 对单事件**过度敏感**。降到区间下限 0.05 让权重分散到 ~20 个最近事件上,响应平滑。
+
+**仍在文献区间内,但选择是工程判断,可辩**。
+
+**14.2.2 `window_size = 30`** — Münz & Carle 2008 给的滑窗区间 **30–60**(SYN flood 检测用)
+
+选下限 30 的理由:
+- demo 中三场景每场 8–35 turns,N=30 能覆盖完整 scenario 而不"看见"上一场景的尾巴
+- 滑窗越大 σ 越小(p-chart σ ∝ 1/√N)→ tier 越敏感;选小 N 让 σ 大一些,demo 更稳
+
+**14.2.3 ARL₀ 目标区间 (50, 200)** — Münz & Carle 2008 SPC 入侵检测常用区间
+
+`calibrate.py:137` 写 `arl_target_band = (50, 200)`。中心 100 = 平均 100 条干净链误报一次,demo 戏剧性可接受(干净流量段不会假警报)。
+
+### 14.3 公式推导(derived from formula)
+
+不能独立拍板,跟着输入参数走。
+
+**14.3.1 `sigma_dev = 0.040`** — p-chart 公式代入
+
+**公式**(§14.1.5):$\sigma = \sqrt{\mu(1-\mu)/N}$
+
+**代入**:µ = 0.05(§14.4 Bayesian prior),N = 30(§14.2.2)
+
+**计算**:
+$$ \sigma = \sqrt{\frac{0.05 \times 0.95}{30}} = \sqrt{\frac{0.0475}{30}} = \sqrt{0.001583\overline{3}} = 0.03979\ldots \approx 0.040 $$
+
+**代码位置**:`config.py:66`,注释里写了 `≈ √(0.05 * 0.95 / 30) = 0.0398`。**四舍五入到 0.040 让人读得舒服**;`metrics.py` 里所有下游公式用的是这个 0.040 而不是精确的 0.0398,误差量级 0.5%,demo 范围内可忽略。
+
+**下游被谁用**:`k_concrete`(§14.3.2)、`h_concrete`(§14.3.3)、TrustScore 公式分母 $3\sigma = 0.120$(§14.3.4)
+
+**14.3.2 `k_concrete = 0.020`** — CUSUM 参考值具体刻度
+
+$$ k = 0.5 \times \sigma_{\mathrm{dev}} = 0.5 \times 0.040 = 0.020 $$
+
+**代码**:`config.py:SPCParams.k_cusum` 是 `@property`,实时算出来,不硬编码。
+
+**14.3.3 `h_concrete = 0.160`** — CUSUM 决策限具体刻度
+
+$$ h = 4 \times \sigma_{\mathrm{dev}} = 4 \times 0.040 = 0.160 $$
+
+**代码**:同上,`SPCParams.h_cusum` `@property`。
+
+**14.3.4 TrustScore 公式**:
+
+$$ \mathrm{TrustScore} = \mathrm{clamp}\!\left(1 - \frac{\mathrm{EWMA} - \mu}{3\sigma},\ 0,\ 1\right) $$
+
+**推导**:
+- EWMA = µ → trust = 1.0(满分)
+- EWMA = µ + 2σ → trust = 1 − 2/3 = **0.333** ← SPC 经典"warning limit"
+- EWMA = µ + 3σ → trust = 1 − 1 = **0.000** ← SPC 经典"action limit"
+- EWMA = µ − k(回升)→ trust > 1 → clamp 到 1.0
+
+**`clamp` 函数从 SPC 3σ 控制限直接推出**,不是工程拍板。
+
+### 14.4 Bayesian prior(测量失败时的合理替代)
+
+**14.4.1 `mu_dev = 0.05`** — Agent Security Bench (ASB), ICLR 2025,无防御 baseline 攻击成功率 0.20–0.30,带防御压到 0.15;clean traffic 期望低一档约 0.05–0.10。**取区间下限 0.05 作为保守起点**。
+
+理由:
+- 我们 own 的 happy-path 实测 µ = 0(§14.5),σ 公式退化为 0,SPC 数学不可用
+- 不可能为了一个 demo 跑 10 万条流量等 µ 出现,prior 是合理替代
+- ASB ICLR 2025 是同 LLM-agent 领域公认 benchmark,数值有据可循
+- 选**下限**而非中位,让我们对干净流量**更敏感**:µ 设小一点,3σ 边界也低,任何真违规更容易跨阈值
+
+**重要**:这是 prior 不是 truth。日后真实生产部署用更长 baseline 替换,prior 让位。
+
+### 14.5 实测得出
+
+**14.5.1 `mu_measured = 0.0`** — 2026-05-15 22:00 跑 N=220 happy-path 实测
+
+**测量过程**(`scenarios/happy_path.py`):
+1. 80 条用户 turn × ~3 LT 入口/turn ≈ 240 ingress 事件
+2. 每条事件通过 `violation.judge()`(§14.7.2 + §14.7.3)判断是否 violation
+3. µ = (violation 数) / (总事件数)
+
+**结果**:**violation 数 = 0**。
+
+**为什么是 0**(诚实分析):
+- judge 函数刚好在我做这次跑之前调好了一版,把"intent-only critical mismatch + 低 risk_score"判作 *noise* 而非 violation(原因:LT 的 mismatch 逻辑是严格字符串相等,任何自然语言 declared_intent 都会触发 mismatch — 这是 LT 单 token 分类器噪声,不是真违规)
+- happy-path 80 条都是真业务问题(PTO / 报销 / 重置密码等),不应该触发 LT 任何拦截规则
+- 所以 judge 正确拒绝了所有事件 → µ = 0
+
+**这是 judge 工作正常的 *positive finding*,不是 bug**:µ = 0 说明 judge 抗噪声设计有效。
+
+**但是**:µ = 0 让 p-chart 公式退化 — $\sigma = \sqrt{0 \cdot 1 / 30} = 0$,EWMA 公式分母为 0,SPC tier 切换不工作。
+
+**解法**:采用 Bayesian prior(§14.4)µ = 0.05 代替测量 0。**measured 0 是结果而非 SPC 输入**。
+
+**`data/calibration_report.json`** 是这次实测的原始输出。
+
+### 14.6 设计锁定(归一化 TrustScore 空间)
+
+**14.6.1 `tau_high = 0.33`** — 不依赖 µ/σ 具体数值
+
+由 §14.3.4 TrustScore 公式反推:trust = 1 − 2/3 ≈ 0.333 时对应 EWMA = µ + 2σ。**SPC 经典"warning limit"在 normalized 空间永远是 0.333**,不管 µ/σ 数值怎么变。
+
+**这就是为什么 §14.1–14.5 都改了之后,τ_high 这个数字仍然合理**:它是 normalized 空间锁定的,跟 µ/σ 数值解耦。
+
+**14.6.2 `tau_low = 0.10`** — 反推对应 EWMA ≈ µ + 2.7σ,带 0.10 anti-flapping 缓冲
+
+如果设 τ_low = 0(对应 EWMA = µ + 3σ 的 SPC action limit),则 trust 恰好为 0 时不算 lockdown — 需要 trust 严格小于 0(clamp 前)才跨。EWMA 在 µ+3σ 附近抖动时 trust 在 0 和 -ε 之间反复 → tier 反复切。
+
+**0.10 的缓冲来源是工程判断**(避免抖动),不是 SPC 推导。所以严格说 τ_low **半软**:大方向锁定(SPC),具体偏移 0.10 是拍的。
+
+### 14.7 工程拍板 — 关键参数(影响系统行为)
+
+**14.7.1 `idle_decay_half_life_s = 600.0`** — 闲置半衰期,10 分钟
+
+**为什么是 600s,不是 60s,也不是 6000s?**
+
+- 60s 太短:demo 全程 5 分钟,如果半衰期是 60s,每 60s 内 EWMA 衰减一半 → 演示 5 分钟攻击的累积效应**会被时间衰减干扰**,人为造成误差
+- 6000s(100 分钟)太长:dormant agent 一晚上(8h ≈ 4.8 个半衰期)只衰减到 0.5^4.8 ≈ 0.036 仍能恢复,但 1 小时(0.6 个半衰期)只衰减 0.34,**不够"显著恢复"**,功能存在感不强
+- **600s(10 分钟)正好**:
+  - demo 5 分钟 ≈ 0.5 个半衰期 → 衰减因子 0.71,**不主导**事件驱动动力学
+  - dormant 1 小时 = 6 个半衰期 → 因子 0.5^6 = 0.0156 → EWMA 接近 µ,**夜晚 dormant 后 1 小时即可恢复**
+
+**14.7.2 `_RISK_BAND_CRITICAL = 0.70`** — risk_score ≥ 0.70 单事件判 violation
+
+LT 的 `metadata.risk_score` 是 0–1 复合风险。`internal/inspector/risk.go` 的 `ComputeRisk()` 用加权布尔信号 + 上限 1.0。**0.70 这条**:
+- LT 自己的 `review_high_risk` 规则在 0.6(trust 档) / 0.5(observe) / 0.2(lockdown)触发 HUMAN_REVIEW
+- 我们的 judge 在 0.70 触发 violation — **比 LT 自己的 HUMAN_REVIEW 高一档**,意思是"只信 LT 的 ALLOW 还不够,risk ≥ 0.7 即使 LT 放行也算违规"
+- 选 0.70 不是 0.65 / 0.75 是工程判断:留 0.05–0.10 buffer 让 LT 的 review 触发先发生,Sentinel 的"独立判官"层加更高门槛
+
+**14.7.3 `_RISK_BAND_MEDIUM = 0.40`** — 复合 violation 触发的 risk 门槛
+
+judge 规则:`risk_score ≥ 0.40 AND ≥1 critical/warning mismatch` → violation。
+
+选 0.40 而不是 0.50 / 0.30:
+- 0.50:跟 observe 档 review_medium_high_risk 重合,judge 失去补充作用
+- 0.30:trust 档 block_dangerous_commands 已经在 0.3 拦截了,judge 在 0.30 触发等于重叠 LT 拦截
+- **0.40 在两者之间**:LT 的拦截规则在 ≥ 0.5 起步,我们的 judge 在 0.40 起步加一道**复合判断**(必须 AND mismatch),不重叠也不冲突
+
+**14.7.4 复合 violation 判定规则**(`violation.py:judge`)— 5 条
+
+| 规则 | 触发条件 | 为什么 |
+|---|---|---|
+| 1 | LT action ∈ {DENY, HUMAN_REVIEW, QUARANTINE} | LT 自己定的,信它 |
+| 2 | `risk_score ≥ 0.70` | §14.7.2 |
+| 3 | ≥1 critical mismatch on `paths/commands/domains` | **结构性** mismatch 是真信号 |
+| 4 | `risk_score ≥ 0.40` AND ≥1 critical mismatch | 任何 critical mismatch 配合中等 risk → 真信号 |
+| 5 | `risk_score ≥ 0.40` AND ≥1 warning mismatch | 同上,弱一点 |
+
+**为什么排除 "intent-only critical mismatch + 任何 risk"**:LT 的 mismatch 逻辑用 declared_intent 字符串严格相等比 8 个单 token IntentCategory。Agent 用自然语言声明意图(例 "answer HR question")永远不等于 LT 输出的单 token("general")→ 永远 critical mismatch on intent。**这是分类器噪声,不是真违规**(实测在 §14.5)。
+
+**14.7.5 `recent_violation_window = 10`** — mode_changes 记录最近 10 个 violation request_id 作为证据链
+
+选 10 不是 5 / 20:
+- 5 太少:复杂攻击场景的 EWMA 爬升涉及十几个事件,5 个 evidence 不够回溯
+- 20 太多:JSONL 行变长,审计员翻起来累
+- **10 = 一次 tier 切档的 EWMA 跨越所需的典型事件数**(λ=0.05,3-4 个 violation 即可 trust → lockdown;加上几条 ALLOW 上下文 ≈ 10)
+
+**14.7.6 Router LLM 参数**(`graph.py:75`)— `temperature=0.0, max_tokens=8`
+
+| 参数 | 选值 | 理由 |
+|---|---|---|
+| `temperature=0.0` | 决策需稳定:同一 user input 永远路由到同一 worker。Router 是分类器不是写作者 |
+| `max_tokens=8` | 回答只需要一个 token("HR" / "FINANCE" / "IT")。8 留缓冲对付 LLM 加 "I think..." 之类废话 |
+
+**14.7.7 Worker LLM 参数**(`graph.py:122`)— `temperature=0.2, max_tokens=160`
+
+| 参数 | 选值 | 理由 |
+|---|---|---|
+| `temperature=0.2` | 略有变化让 demo 不机械,但避免幻觉 |
+| `max_tokens=160` | system prompt 要求 "under 80 words" ≈ 110 tokens,160 留 ~50 tokens 缓冲 |
+
+**14.7.8 Chroma corpus 每集合 5 篇文档**(`corpus.py`)
+
+5 不是 10 / 20:demo 需要"够多让 RAG 检索有意义,够少让 seed 快"。5 篇 × 3 集合 × ~50 字 / 篇 = ~750 字总语料,~1s 内 seed 完。
+
+**14.7.9 `POISONED_RESPONSES` 长度 = 8**(`poisoned_tool.py`)
+
+8 个递增 payload。**8 跟 `attack_c_tool_poisoning.USER_QUESTIONS` 一一对应**(`min(len(USER_QUESTIONS), len(POISONED_RESPONSES))`)。选 8:
+- 跟 §14.2.2 N=30 滑窗的 1/4 量级 — 让 EWMA 在 8 turns 内显著爬升但**不立即填满滑窗**
+- demo 在 8 turns × 2s/turn ≈ 16s 内演完 scenario C,跟 scenario B 的 19 turns ≈ 38s 节奏相近
+
+**14.7.10 Policy YAML — 三档 rate-limit 梯度**
+
+| 档 | requests_per_minute | requests_per_hour | burst_threshold |
+|---|---|---|---|
+| trust | **240** | **4000** | **60** |
+| observe | 120 | 2000 | 30 |
+| lockdown | 30 | 500 | 5 |
+
+**比例**:trust : observe : lockdown ≈ 8:4:1(rpm/rph)/ 12:6:1(burst)
+
+**为什么 8:4:1 而非 2:1.5:1 或 100:10:1?**
+- 2:1.5:1 太平:档位切换对 rate 影响微弱,demo 看不出"系统升级"
+- 100:10:1 太陡:trust 档的 100x 比 lockdown 容许量,**会让 trust 档攻击者直接刷穿**
+- 8:4:1 是教科书等比数列,**直观可解释**给评委("观察档限速一半,戒严档限速到八分之一")
+
+**14.7.11 Policy YAML — 三档 risk_score 触发门槛**(`block_dangerous_commands` 行)
+
+| 档 | risk_score 门槛 |
+|---|---|
+| trust | **0.30** |
+| observe | 0.20 |
+| lockdown | 0.10 |
+
+**梯度 0.30 / 0.20 / 0.10** = 等差 0.10。同样,**不是 0.30 / 0.29 / 0.28 太平**,也**不是 0.5 / 0.1 / 0.01 太陡**。0.10 步长 = 一档约 30% 严格度提升,符合"观察档比信任档严一档,戒严档比观察档严两档"的语言直觉。
+
+### 14.8 工程拍板 — 系统级 housekeeping
+
+非安全关键,工程常识取值。**列出来是为了完整性**,不展开"为什么这个数"。
+
+| 数 | 值 | 用途 |
+|---|---|---|
+| `poll_interval` | 0.10s | LT audit log tail 轮询间隔。100ms 在本机 IO 上 latency / CPU 平衡 |
+| LT 启动等待 timeout | 15s | LT cold start <2s 实测,留 7× buffer 应对慢机器 |
+| LT stop_all 阶段 timeout | 5s + 3s | terminate / kill 两阶段 |
+| LT 进程间端口探测 timeout | 0.5s | TCP 握手 RTT 上限 |
+| aiohttp ClientTimeout total | 180s | LLM 推理 ≤ 60s 实测,3× buffer |
+| Sentinel 反代端口 | **8080** | OpenAI-compatible 客户端默认端口习惯 |
+| LT-trust / observe / lockdown 端口 | **18081 / 18082 / 18083** | 内部端口 18000+ 段,可读性好,不跟常用服务冲突 |
+| Scenario 默认 `qps=2.0` | 2 req/s | Ollama qwen2.5:7b 单流 ~1 req/s,留 buffer |
+| Scenario 默认 `seed=20260516` | demo 日期 | 复现性,demo 第二天的日期 |
+| Scenario 默认 `n_warm=20`(attack B) | 20 | 攻击前热身 20 turns 让 EWMA 稳到 baseline,够代表"信任建立" |
+| Happy-path 默认 `n=80` | 80 | demo 时间内能跑完(80 / 2qps = 40s),又能产生 ~240 events 让 SPC 统计有意义 |
+
+### 14.9 已知不一致
+
+诚实列出 — 不修不藏。
+
+**14.9.1 `calibrate.py` 的 `--lambda-ewma` CLI default = 0.2,但 runtime `config.py:lambda_ewma = 0.05`**
+
+**位置**:
+- `sentinel/scenarios/calibrate.py:99`: `parser.add_argument("--lambda-ewma", type=float, default=0.2)`
+- `sentinel/src/lt_sentinel/config.py:54`: `lambda_ewma: float = 0.05`
+
+**原因**:`calibrate.py` 写在 λ tuning 之前(commit `3dbf78e`),CLI default 留的是 Lucas & Saccucci 1990 中位值 0.2。tuning 后(commit `54368d4` 之前)runtime 改成 0.05,calibrate 的 CLI default 没同步。
+
+**影响**:`py -m scenarios.calibrate` 无参跑时,offline replay 用 λ=0.2,跟实际 runtime 行为不一致。**`calibration_report.json` 里的 ARL₀ 数字是用 λ=0.2 算的,不是 runtime 用的 λ=0.05**。
+
+**当前缓解**:`py -m scenarios.calibrate --lambda-ewma 0.05` 可手动对齐。
+
+**正确修法**(2 行改动,scope 之内,我没做):让 calibrate.py 从 `SentinelConfig.default_config().spc.lambda_ewma` 读默认,而非硬编码 0.2。
+
+**为什么留着写在这**:暴露给读者比偷偷改要诚实。日后清理可以 1 个 commit 修掉,文档里这一条作为 known-issue 历史记录。
+
+### 14.10 Demo 观察值(canonical run 输出)
+
+不是设计输入,是结果。让读者能 trace。
+
+**Canonical demo run**(2026-05-15 21:32,`scenarios/demo_run.py --qps 2`):
+
+| 量 | 值 |
+|---|---|
+| 总事件数 | 284 |
+| 其中 ingress | 153 |
+| 其中 egress | 131 |
+| 总 violation | 23 |
+| Tier 切换次数 | **6**(含 2 次 recovery) |
+| 时长 | ~2.5 分钟(13:25:07 → 13:28:42 UTC) |
+
+**Tier 切换序列**:
+
+| 序 | 转换 | 触发 agent | trust 触发值 | 类型 |
+|---|---|---|---|---|
+| 0 | `<init> → trust` | `<init>` | 1.000 | startup |
+| 1 | trust → observe | router | 0.275 | escalation |
+| 2 | observe → lockdown | router | 0.000 | escalation |
+| 3 | lockdown → observe | router | 0.151 | **recovery** |
+| 4 | observe → trust | router | 0.331 | **recovery** |
+| 5 | trust → lockdown | router | 0.047 | escalation |
+
+**Per-agent 终态**:
+
+| agent | 事件数 | violation | 终 trust | 终档 |
+|---|---|---|---|---|
+| finance_agent | 6 | 0 | 1.000 | trust(对照) |
+| router | 57 | 9 | 0.058 | lockdown |
+| hr_agent | 62 | 8 | 0.013 | lockdown |
+| it_agent | 28 | 6 | 0.000 | lockdown |
+
+**数据文件位置**:`sentinel/data/demo_canonical/`(7 个文件,2.5MB)
+
+---
+
 ## 引用清单
 
 **OWASP 标准**

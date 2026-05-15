@@ -161,6 +161,8 @@ py -m scenarios.calibrate          # writes data/calibration_report.json
 
 Calibration script: `sentinel/scenarios/calibrate.py`. Full method: [`DESIGN.md`](DESIGN.md) §12.
 
+**Every number in the project — λ, σ, τ thresholds, judge risk bands, idle-decay half-life, policy rate-limit gradients, scenario seeds — is catalogued in [`DESIGN.md`](DESIGN.md) §14 by category** (literature / within-range engineering pick / formula-derived / Bayesian prior / measured / normalized-space lock / engineering pick / housekeeping), with full derivations for the formula-derived values and "why this number not another" for every engineering pick.
+
 ## What's in the repo
 
 ```

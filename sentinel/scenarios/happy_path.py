@@ -1,12 +1,12 @@
-"""Happy-path baseline runner (DESIGN.md §12.2.A).
+"""Happy-path baseline runner (DESIGN.md §12.2.A) — real multi-agent edition.
 
-Fires N normal AcmeCorp request chains through Sentinel:8080, one chain per
-ScriptedTurn from prompts.py. Each prompt is a routine internal query that
-should NOT trigger LT's DPI rules. Run from a fresh Sentinel start so the
-sentinel_events.jsonl only contains baseline data.
+Fires N benign user requests through the LangGraph router. The router
+classifies each one and forwards to HR / Finance / IT. Workers answer
+directly (no tool call needed for some questions) or call their Chroma
+RAG tool. All LLM calls flow through Sentinel → LT with proper agent_id.
 
-After completion, run `calibrate.py` against the produced sentinel_events.jsonl
-to compute µ_dev, σ_dev, h_concrete, and offline ARL₀.
+After completion, run `calibrate.py` against sentinel_events.jsonl to
+compute μ_dev / σ_dev / h_concrete / ARL₀ on real agent traffic.
 """
 
 from __future__ import annotations
@@ -15,90 +15,54 @@ import argparse
 import asyncio
 import random
 import time
-from pathlib import Path
 
-from .client import SentinelClient
-from .prompts import happy_path_corpus
-
-
-async def _drive_one_turn(client: SentinelClient, turn) -> tuple[str, str, bool]:
-    res = await client.send_chat(
-        agent_id=turn.agent_id,
-        declared_intent=turn.declared_intent,
-        user_text=turn.user_text,
-    )
-    return turn.agent_id, res.verdict, res.rejected
+from .graph_runner import GraphRunner
+from .prompts import FINANCE_HAPPY, HR_HAPPY, IT_HAPPY, ROUTER_HAPPY
 
 
-async def run(
-    *,
-    base_url: str,
-    model: str,
-    n_chains: int,
-    max_tokens: int,
-    seed: int,
-    qps: float,
-) -> None:
-    corpus = happy_path_corpus()
+def _build_corpus() -> list[str]:
+    return ROUTER_HAPPY + HR_HAPPY + FINANCE_HAPPY + IT_HAPPY
+
+
+async def run(*, n_chains: int, qps: float, seed: int) -> None:
     rng = random.Random(seed)
-    plan = [rng.choice(corpus) for _ in range(n_chains)]
-
-    n_by_agent: dict[str, int] = {}
-    n_rejected_by_agent: dict[str, int] = {}
-    verdict_counts: dict[str, int] = {}
+    corpus = _build_corpus()
+    delay = 1.0 / qps if qps > 0 else 0.0
+    runner = GraphRunner()
     start = time.time()
 
-    delay = 1.0 / qps if qps > 0 else 0.0
+    by_route: dict[str, int] = {}
+    n_tool: int = 0
+    n_err: int = 0
 
-    async with SentinelClient(
-        base_url=base_url, model=model, max_tokens=max_tokens
-    ) as client:
-        for i, turn in enumerate(plan):
-            try:
-                aid, verdict, rejected = await _drive_one_turn(client, turn)
-            except Exception as exc:
-                print(f"[{i+1:3d}/{n_chains}] {turn.agent_id:14s}  ERROR: {exc}")
-                continue
-            n_by_agent[aid] = n_by_agent.get(aid, 0) + 1
-            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
-            if rejected:
-                n_rejected_by_agent[aid] = n_rejected_by_agent.get(aid, 0) + 1
-            print(
-                f"[{i+1:3d}/{n_chains}] {turn.agent_id:14s}  verdict={verdict:6s}"
-                f"  rej={'Y' if rejected else 'n'}"
-            )
-            if delay > 0:
-                await asyncio.sleep(delay)
+    for i in range(n_chains):
+        text = rng.choice(corpus)
+        outcome = await runner.user_turn(text)
+        by_route[outcome.routed_to] = by_route.get(outcome.routed_to, 0) + 1
+        if outcome.tool_called:
+            n_tool += 1
+        if outcome.error:
+            n_err += 1
+        print(f"[{i + 1:3d}/{n_chains}] {outcome.short}")
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     elapsed = time.time() - start
     print()
     print(f"happy-path complete: {n_chains} chains in {elapsed:.1f}s "
           f"({n_chains / max(elapsed, 0.001):.2f} chains/s)")
-    print(f"verdict distribution: {verdict_counts}")
-    print(f"per-agent counts:    {n_by_agent}")
-    print(f"per-agent rejections: {n_rejected_by_agent}")
+    print(f"router distribution: {by_route}")
+    print(f"tool calls          : {n_tool}/{n_chains}")
+    print(f"errors              : {n_err}/{n_chains}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LT-Sentinel happy-path baseline runner")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--model", default="qwen3:8b")
-    parser.add_argument("--n", type=int, default=200, help="number of chains")
-    parser.add_argument("--max-tokens", type=int, default=8)
+    parser = argparse.ArgumentParser(description="LT-Sentinel happy-path baseline runner (LangGraph)")
+    parser.add_argument("--n", type=int, default=80, help="number of user chains")
+    parser.add_argument("--qps", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=20260515)
-    parser.add_argument("--qps", type=float, default=4.0, help="target requests/s (sequential, not concurrent)")
     args = parser.parse_args()
-
-    asyncio.run(
-        run(
-            base_url=args.base_url,
-            model=args.model,
-            n_chains=args.n,
-            max_tokens=args.max_tokens,
-            seed=args.seed,
-            qps=args.qps,
-        )
-    )
+    asyncio.run(run(n_chains=args.n, qps=args.qps, seed=args.seed))
 
 
 if __name__ == "__main__":

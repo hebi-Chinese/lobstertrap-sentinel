@@ -9,6 +9,9 @@ sentinel/data/*.png
 sentinel/data/calibration_report.json
 !sentinel/data/demo_canonical/
 
+# Chroma persistence — users regenerate with `lt-agents seed`
+sentinel/data/chroma_seed/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -33,18 +33,18 @@ This directly maps to Track 1's Veea bonus criteria: *declared-versus-detected i
 
 ## Canonical demo result
 
-The chart below is produced by `sentinel/scenarios/demo_run.py` — one Sentinel start, one 184-event run covering all three attack classes:
+The chart below is produced by `sentinel/scenarios/demo_run.py` — one Sentinel start, one 153-ingress-event run through the real LangGraph multi-agent system covering all three attack classes:
 
 ![per-agent TrustScore time series](sentinel/data/demo_canonical/chart_trust_timeseries.png)
 
 | Agent | Scenario | Final TrustScore | Final tier | What happened |
 |---|---|---|---|---|
-| `finance_agent` | (control — never attacked) | 1.000 | trust | flat baseline |
-| `router` | A — slow injection | 0.870 | trust | saw-tooth oscillation, each cycle a `block_prompt_injection` hit decays back |
-| `hr_agent` | B — trust-then-burst | 0.182 | **observe** | 20 benign warm-ups then 4-burst ladder; first burst LT-DENY'd, then 3 progressively riskier prompts pushed EWMA across τ_high |
-| `it_agent` | C — slow tool poisoning | 0.000 | **lockdown** | 8 simulated tool returns of climbing severity; turns 5–8 each hit a different LT rule, EWMA passed τ_low |
+| `finance_agent` | (control — never attacked) | 1.000 | trust | flat baseline through every phase |
+| `router` | A — slow injection | 0.058 | **lockdown** | Router LLM classifies the slow-injection prompts; its TrustScore descends in tandem with HR (who receives the forwarded payloads) |
+| `hr_agent` | B — trust-then-burst | 0.013 | **lockdown** | 15 benign warm-ups, then 4-burst ladder via the router; the first burst is denied by LT (`block_data_exfiltration`), the next three each hit a different lockdown-tier rule |
+| `it_agent` | C — slow tool poisoning | 0.000 | **lockdown** | IT calls `fetch_external_calendar` (a deliberately compromised LangGraph tool); 8 escalating payloads returned as real `role:"tool"` messages; turns 5–8 each blocked by a different rule |
 
-Two tier transitions captured in `sentinel_mode_changes.jsonl`, each with a complete agent snapshot and the evidence `request_id` list. Sample:
+Six tier transitions captured in `sentinel_mode_changes.jsonl`, including **two recoveries** — Scenario A drove the system into lockdown, the recovery period rebuilt trust back through observe and trust, then Scenarios B + C drove it down again. Sample tier change record:
 
 ```json
 {
@@ -65,64 +65,85 @@ Two tier transitions captured in `sentinel_mode_changes.jsonl`, each with a comp
 ## Architecture
 
 ```
-                     ┌──────────────────────────────┐
-   agents ─────────▶ │ LT-Sentinel reverse proxy    │ ─┐
-   (HR/Finance/IT/   │ :8080                        │  │ tier-aware
-    Router)          │ (atomic current_tier_port)   │  │ port-swap
-                     └──────────────────────────────┘  │
-                                                       ▼
-            ┌────────────────────┬────────────────────┬────────────────────┐
-            │ LT-Trust :18081    │ LT-Observe :18082  │ LT-Lockdown :18083 │
-            │ policy_trust.yaml  │ policy_observe.yaml│ policy_lockdown.yaml│
-            └────────────────────┴────────────────────┴────────────────────┘
-                                  │   │   │
-                                  ▼   ▼   ▼  (audit-log JSONL, append-only)
-            ┌─────────────────────────────────────────────────────────────┐
-            │ Sentinel monitor (tail × 3, merge, per-agent OER/EWMA/CUSUM,│
-            │ TrustScore, tier decision, mode-change record)              │
-            └─────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-                    sentinel_events.jsonl + sentinel_mode_changes.jsonl
-                    + trust_history.jsonl (used by visualize.py)
+user input
+   │
+   ▼
+┌───────────────────────────────────────────────────────────┐
+│ lt_agents (LangGraph StateGraph)                           │
+│   Router LLM ──► HR / Finance / IT worker                  │
+│                       │                                    │
+│                       ├──► ToolNode (Chroma RAG)          │
+│                       │     └─ role:"tool" reply back     │
+│                       └──► worker finalizes               │
+└──────────────────┬────────────────────────────────────────┘
+                   │ every LLM call: ChatOpenAI(extra_body={"_lobstertrap":{...}})
+                   ▼
+┌───────────────────────────────────────────────────────────┐
+│ LT-Sentinel reverse proxy :8080                            │
+│   atomic current_tier_port                                 │
+└──────┬───────────────┬───────────────┬────────────────────┘
+       │               │               │
+       ▼               ▼               ▼
+   LT-Trust       LT-Observe      LT-Lockdown
+   :18081         :18082          :18083
+   policy_trust   policy_observe  policy_lockdown
+       │               │               │
+       ▼               ▼               ▼  (audit-log JSONL, append-only)
+┌───────────────────────────────────────────────────────────┐
+│ Sentinel monitor — tail × 3, merge, per-agent             │
+│ OER / EWMA / CUSUM / TrustScore, tier decision,           │
+│ mode-change record                                         │
+└────────────────────┬──────────────────────────────────────┘
+                     ▼
+    sentinel_events.jsonl + sentinel_mode_changes.jsonl
+    + trust_history.jsonl (used by visualize.py)
 ```
 
 Three LT instances stay up the whole time. Sentinel never reloads LT, never modifies LT source. Tier change is a pointer flip in Sentinel's reverse-proxy. **In-flight requests against the previous tier finish unaffected; new requests instantly route to the new tier's LT.** This is Option C in [`DESIGN.md`](DESIGN.md) §11.5 — chosen because LT has no built-in hot-reload (verified by source read of `cmd/serve.go` and `internal/pipeline/pipeline.go`).
 
+The **agents process** is a single Python program running a LangGraph `StateGraph`: Router classifies user input and dispatches via a conditional edge to one of three workers; each worker has its own Chroma-backed retrieval tool and uses LangChain `bind_tools` so tool returns arrive as real `role:"tool"` messages. Scenario C additionally binds a deliberately compromised `fetch_external_calendar` tool to the IT worker.
+
 ## Quickstart
 
-Prerequisites: Go 1.22+, Python 3.10+, Ollama with at least one OpenAI-compatible model installed (we use `qwen2.5:7b`).
+Prerequisites: Go 1.22+, Python 3.10+, Ollama with at least one OpenAI-compatible tool-calling model installed (we use `qwen2.5:7b`).
 
 ```bash
 # 1) build LT (one time)
 cd lobstertrap && go build -o lobstertrap.exe . && cd ..
 
-# 2) install Sentinel
-cd sentinel && py -m pip install -e .[viz,dev] && cd ..
+# 2) install Sentinel + agents
+cd sentinel && py -m pip install -e .[viz,dev]
 
-# 3) start Sentinel (foreground; this spawns the 3 LT instances + proxy)
-cd sentinel && py -m lt_sentinel.cli run
+# 3) seed Chroma (one time — downloads the all-MiniLM-L6-v2 embedding model)
+py -m lt_agents.cli seed
+
+# 4) start Sentinel (foreground; spawns the 3 LT instances + proxy)
+py -m lt_sentinel.cli run
 ```
 
 In another terminal:
 
 ```bash
-# 4a) run the canonical demo (all 3 attack scenarios in sequence)
-cd sentinel && py -m scenarios.demo_run --qps 8 --model qwen2.5:7b
+cd sentinel
+# 5a) ad-hoc smoke — single user query through the LangGraph agents
+py -m lt_agents.cli ask "What is the PTO carry-over policy?"
 
-# 4b) render the chart
-cd sentinel && py -m scenarios.visualize
+# 5b) run the canonical demo (all 3 attack scenarios in sequence)
+py -m scenarios.demo_run --qps 2
 
-# 5) inspect the audit trails
-type sentinel/data/sentinel_mode_changes.jsonl
-type sentinel/data/sentinel_events.jsonl
+# 5c) render the chart
+py -m scenarios.visualize
+
+# 6) inspect the audit trails
+type data/sentinel_mode_changes.jsonl
+type data/sentinel_events.jsonl
 ```
 
 To run baseline calibration from scratch:
 
 ```bash
 cd sentinel
-py -m scenarios.happy_path --n 200 --model qwen2.5:7b
+py -m scenarios.happy_path --n 80
 py -m scenarios.calibrate          # writes data/calibration_report.json
 ```
 
@@ -149,36 +170,47 @@ lablab-techex-track1-lobstertrap/
 ├── README.md                   this file
 ├── lobstertrap/                Veea Lobster Trap — read-only, MIT-licensed upstream
 │   └── ...                     unmodified
-└── sentinel/                   LT-Sentinel sidecar (this project)
+└── sentinel/                   LT-Sentinel + agents (this project)
     ├── pyproject.toml
     ├── README.md               developer guide
     ├── policies/
     │   ├── policy_trust.yaml       6 ingress / 2 egress rules — baseline
     │   ├── policy_observe.yaml    13 ingress / 3 egress rules — heightened
     │   └── policy_lockdown.yaml   14 ingress / 4 egress rules — strict
-    ├── src/lt_sentinel/
-    │   ├── config.py           SPC params + tier bindings (all knobs here)
-    │   ├── violation.py        the gray-area judge — §11.9
-    │   ├── metrics.py          PerAgentState (EWMA / CUSUM / TrustScore) + AgentRegistry
-    │   ├── tier_state.py       global tier decision
-    │   ├── audit_writers.py    JSONL writers for §11.6 audit trail
-    │   ├── log_tail.py         async multi-file tailer (3 LT audit logs)
-    │   ├── supervisor.py       lifecycle for the 3 LT instances
-    │   ├── proxy.py            tier-aware reverse proxy on :8080
-    │   ├── runtime.py          the wired-up event loop
-    │   └── cli.py              `lt-sentinel run | show-config | replay`
+    ├── src/
+    │   ├── lt_sentinel/        — Sentinel runtime (sidecar)
+    │   │   ├── config.py           SPC params + tier bindings (all knobs here)
+    │   │   ├── violation.py        gray-area judge — §11.9
+    │   │   ├── metrics.py          PerAgentState (EWMA / CUSUM / TrustScore)
+    │   │   ├── tier_state.py       global tier decision
+    │   │   ├── audit_writers.py    JSONL writers for §11.6 audit trail
+    │   │   ├── log_tail.py         async multi-file tailer (3 LT audit logs)
+    │   │   ├── supervisor.py       lifecycle for the 3 LT instances
+    │   │   ├── proxy.py            tier-aware reverse proxy on :8080
+    │   │   ├── runtime.py          the wired-up event loop
+    │   │   └── cli.py              `lt-sentinel run | show-config | replay`
+    │   └── lt_agents/          — LangGraph multi-agent system
+    │       ├── identity.py         per-worker declared scopes (router/hr/finance/it)
+    │       ├── corpus.py           AcmeCorp seed policy docs (5 HR + 5 Finance + 5 IT)
+    │       ├── rag.py              Chroma collections + @tool-decorated retrievers
+    │       ├── llm.py              ChatOpenAI factory injecting _lobstertrap extra_body
+    │       ├── graph.py            StateGraph: Router → 3 workers → 3 ToolNodes
+    │       └── cli.py              `lt-agents ask | seed`
     ├── scenarios/
-    │   ├── prompts.py          happy-path & attack prompt corpora
-    │   ├── client.py           OpenAI-compatible client → Sentinel proxy
-    │   ├── happy_path.py       N=200 baseline runner
+    │   ├── prompts.py          happy-path query corpora (HR / Finance / IT / Router)
+    │   ├── graph_runner.py     thin wrapper that drives the LangGraph for scenarios
+    │   ├── poisoned_tool.py    Scenario-C compromised `fetch_external_calendar` tool
+    │   ├── happy_path.py       N=80 baseline runner through agents
     │   ├── calibrate.py        offline μ / σ / h / ARL₀ calculator
     │   ├── attack_a_slow_injection.py
     │   ├── attack_b_trust_then_burst.py
     │   ├── attack_c_tool_poisoning.py
-    │   ├── demo_run.py         the canonical end-to-end demo
+    │   ├── demo_run.py         canonical end-to-end demo
     │   └── visualize.py        matplotlib chart of trust_history + transitions
     ├── tests/test_metrics.py   28 unit tests — math + judge regression
-    └── data/                   JSONL outputs + chart PNGs (gitignored)
+    └── data/                   JSONL outputs + chart PNGs + canonical demo dataset
+        ├── chroma_seed/        persisted Chroma database (HR / Finance / IT collections)
+        └── demo_canonical/     canonical run dataset — gitted for reproducibility
 ```
 
 ## Track 1 evaluation alignment
@@ -193,11 +225,12 @@ lablab-techex-track1-lobstertrap/
 
 ## What it explicitly is NOT
 
-* not a fork of Lobster Trap (the LT directory in this repo is the upstream MIT-licensed binary source; we do not modify it)
+* not a fork of Lobster Trap (the LT directory in this repo is the upstream MIT-licensed source; we do not modify it)
 * not an LT optimisation or replacement
 * not a single-event DPI (LT does that)
-* not an authentication / user identity system (production deployments need OAuth or mTLS in front of Sentinel; here `_lobstertrap.agent_id` is **declarative** identity for governance purposes)
+* not an authentication / user identity system — production deployments need OAuth or mTLS in front of Sentinel; here `_lobstertrap.agent_id` is **declarative** identity for governance purposes
 * not a per-identity policy router — current LT policy YAML conditions don't accept `agent_id` as a field, so tier change is global ("连坐制" in DESIGN.md §11.2). Per-identity policy is a future-work item flagged in the README and the design doc.
+* not adaptive-attacker-robust — SPC has a known blind spot for adversaries tuning rate just under threshold (DESIGN.md §7.4). Randomised thresholds + RL-based detector are the standard countermeasures; not implemented here.
 
 ## License
 

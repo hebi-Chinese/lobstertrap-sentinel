@@ -16,9 +16,9 @@ before **2026-05-19 08:00 China Standard Time**.
 
 > Adds cross-event statistical monitoring (OER · EWMA · CUSUM) on top of Veea Lobster Trap to catch attacks that single-event DPI misses.
 
-## Long Description (paragraph, ~600 chars)
+## Long Description (paragraph, ~700 chars)
 
-> LT-Sentinel is a sidecar that gives Veea Lobster Trap something it doesn't have today: memory across events. It tails Lobster Trap's audit log, maintains a per-agent OER / EWMA / CUSUM TrustScore, and atomically swings traffic between three pre-warmed Lobster Trap instances loaded with three escalating policies (Trust, Observe, Lockdown). Tier change is a pointer flip in Sentinel's reverse proxy — zero downtime, no Lobster Trap source change. Every tier transition writes a regulator-readable JSONL record with trigger agent, full per-agent snapshot, and evidence request IDs that chain back into Lobster Trap's own audit log. Single Python process, MIT-licensed.
+> LT-Sentinel is a cross-event statistical-monitoring layer on top of Veea Lobster Trap. It runs three pre-warmed Lobster Trap instances loaded with escalating policies (Trust / Observe / Lockdown) and a tiny reverse proxy that atomically swings traffic between them based on per-agent OER / EWMA / CUSUM TrustScores. On top sits a real LangGraph multi-agent system (Router + HR + Finance + IT workers, each with a Chroma-backed tool that returns proper `role:"tool"` messages) so every threat scenario flows through realistic agent traffic. Every tier transition writes a regulator-readable JSONL record with trigger agent, full per-agent TrustScore snapshot, evidence request IDs chaining back to LT's own audit log, and which policy file became active. Tier change is a pointer flip — zero downtime, no Lobster Trap source change. MIT-licensed; runs on Ollama or any OpenAI-compatible backend.
 
 ## Technology / Category Tags
 
@@ -29,7 +29,9 @@ Recommended tags (pick whichever the lablab form accepts):
 * Audit Trails / Observability
 * Statistical Process Control
 * Veea Lobster Trap
-* Ollama (or whatever local LLM you use in the demo video)
+* LangGraph · LangChain
+* Chroma (RAG)
+* Ollama (or whatever LLM you use in the demo video)
 * Python · Go · YAML
 * Open Source · MIT
 

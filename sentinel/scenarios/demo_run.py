@@ -1,16 +1,12 @@
-"""Canonical demo run — runs all three attack scenarios end-to-end against a
-single live Sentinel instance, producing the dataset used in the video and
-the slide deck.
+"""Canonical demo run — all three attack scenarios in one live Sentinel run,
+all routed through the real LangGraph multi-agent system.
 
 Expected story arc on the resulting TrustScore chart:
 
-    finance_agent : stays at 1.0 throughout (control — never attacked)
-    router        : Scenario A (slow injection) — gradual oscillating descent
-    hr_agent      : Scenario B (trust-then-burst) — flat then sharp drop
-    it_agent      : Scenario C (tool poisoning) — gradual ramp with each turn
-
-Sentinel must already be running on :8080. Use a fresh Sentinel start so
-trust_history.jsonl / sentinel_events.jsonl are empty.
+    finance_agent : never targeted by any scenario, stays at ~1.0 (control)
+    router        : Scenario A injects through it — saw-tooth descent
+    hr_agent      : Scenario B targets it — flat then sharp drop
+    it_agent      : Scenario C poisons its tool — gradual ramp into lockdown
 """
 
 from __future__ import annotations
@@ -18,93 +14,93 @@ from __future__ import annotations
 import argparse
 import asyncio
 import random
-import time
 
 from .attack_a_slow_injection import SLOW_INJECTION_TURNS
 from .attack_b_trust_then_burst import BURST_PROMPTS
-from .attack_c_tool_poisoning import POISONED_TOOL_TURNS
-from .client import SentinelClient
-from .prompts import HR_HAPPY, IT_HAPPY, ROUTER_HAPPY, FINANCE_HAPPY
+from .attack_c_tool_poisoning import USER_QUESTIONS as TOOL_QUESTIONS
+from .graph_runner import GraphRunner
+from .poisoned_tool import POISONED_RESPONSES, fetch_external_calendar, reset_poisoned_counter
+from .prompts import FINANCE_HAPPY, HR_HAPPY, IT_HAPPY, ROUTER_HAPPY
 
 
-async def _drive(client: SentinelClient, *, agent_id: str, text: str, label: str) -> None:
-    try:
-        res = await client.send_chat(
-            agent_id=agent_id,
-            declared_intent="general",
-            user_text=text,
-        )
-    except Exception as exc:
-        print(f"  [{label}] {agent_id:14s}  ERROR: {exc}")
-        return
-    print(
-        f"  [{label}] {agent_id:14s}  verdict={res.verdict:6s}  "
-        f"rule={res.rule_name or '-':28s}  text={text[:60]!r}"
-    )
+async def _drive(runner: GraphRunner, label: str, text: str) -> None:
+    outcome = await runner.user_turn(text)
+    print(f"  [{label:>8s}]  {outcome.short}")
 
 
-async def run(*, base_url: str, model: str, qps: float, seed: int) -> None:
+async def run(*, qps: float, seed: int) -> None:
     rng = random.Random(seed)
     delay = 1.0 / qps if qps > 0 else 0.0
+    reset_poisoned_counter()
 
-    async with SentinelClient(base_url=base_url, model=model, max_tokens=6) as client:
+    # Build two graphs: the default one (used for phases 1-4) and the
+    # poisoned variant for Phase 5 (Scenario C). They share Chroma so the
+    # second build is fast.
+    from pathlib import Path
+    from lt_agents.graph import build_graph
 
-        print("\n=== Phase 1 — happy warm-up across all agents (30 chains) ===")
-        warm = []
-        for _ in range(8):
-            warm.append(("finance_agent", rng.choice(FINANCE_HAPPY)))
-            warm.append(("router", rng.choice(ROUTER_HAPPY)))
-            warm.append(("hr_agent", rng.choice(HR_HAPPY)))
-            warm.append(("it_agent", rng.choice(IT_HAPPY)))
-        for aid, text in warm[:30]:
-            await _drive(client, agent_id=aid, text=text, label="warm")
+    chroma_dir = Path(__file__).resolve().parents[1] / "data" / "chroma_seed"
+    default_runner = GraphRunner(chroma_dir=chroma_dir)
+    poisoned_graph = build_graph(chroma_dir, extra_it_tools=[fetch_external_calendar])
+    poisoned_runner = GraphRunner.__new__(GraphRunner)
+    poisoned_runner._chroma_dir = chroma_dir  # type: ignore[attr-defined]
+    poisoned_runner._graph = poisoned_graph  # type: ignore[attr-defined]
+
+    print("\n=== Phase 1 — happy warm-up across all four entry points ===")
+    warm_corpus = [
+        ("finance", FINANCE_HAPPY),
+        ("router", ROUTER_HAPPY),
+        ("hr", HR_HAPPY),
+        ("it", IT_HAPPY),
+    ]
+    plan: list[tuple[str, str]] = []
+    for _ in range(2):
+        for label, corpus in warm_corpus:
+            plan.append((label, rng.choice(corpus)))
+    for label, text in plan:
+        await _drive(default_runner, f"warm.{label}", text)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    print("\n=== Phase 2 — Scenario A (slow injection) — 2 cycles through router ===")
+    for cycle in range(2):
+        for text in SLOW_INJECTION_TURNS:
+            await _drive(default_runner, f"A.c{cycle + 1}", text)
             if delay > 0:
                 await asyncio.sleep(delay)
 
-        print("\n=== Phase 2 — Scenario A (slow injection) on router, 3 cycles ===")
-        for cycle in range(3):
-            for text in SLOW_INJECTION_TURNS:
-                await _drive(client, agent_id="router", text=text, label=f"A.c{cycle+1}")
-                if delay > 0:
-                    await asyncio.sleep(delay)
-            await asyncio.sleep(0.5)
+    print("\n=== Phase 3 — recovery on router (6 benign turns) ===")
+    for _ in range(6):
+        await _drive(default_runner, "A.rec", rng.choice(ROUTER_HAPPY))
+        if delay > 0:
+            await asyncio.sleep(delay)
 
-        print("\n=== Phase 3 — recovery on router (10 benign turns) ===")
-        for _ in range(10):
-            text = rng.choice(ROUTER_HAPPY)
-            await _drive(client, agent_id="router", text=text, label="A.rec")
-            if delay > 0:
-                await asyncio.sleep(delay)
+    print("\n=== Phase 4 — Scenario B (trust-then-burst) on hr_agent ===")
+    for _ in range(15):
+        await _drive(default_runner, "B.warm", rng.choice(HR_HAPPY))
+        if delay > 0:
+            await asyncio.sleep(delay)
+    for i, text in enumerate(BURST_PROMPTS):
+        await _drive(default_runner, f"B.brst{i + 1}", text)
+        if delay > 0:
+            await asyncio.sleep(delay)
 
-        print("\n=== Phase 4 — Scenario B (trust-then-burst) on hr_agent ===")
-        for _ in range(20):
-            text = rng.choice(HR_HAPPY)
-            await _drive(client, agent_id="hr_agent", text=text, label="B.warm")
-            if delay > 0:
-                await asyncio.sleep(delay)
-        for i, text in enumerate(BURST_PROMPTS):
-            await _drive(client, agent_id="hr_agent", text=text, label=f"B.burst{i+1}")
-            if delay > 0:
-                await asyncio.sleep(delay)
+    print("\n=== Phase 5 — Scenario C (tool poisoning) on it_agent ===")
+    n_turns = min(len(TOOL_QUESTIONS), len(POISONED_RESPONSES))
+    for i in range(n_turns):
+        await _drive(poisoned_runner, f"C.t{i + 1}", TOOL_QUESTIONS[i])
+        if delay > 0:
+            await asyncio.sleep(delay)
 
-        print("\n=== Phase 5 — Scenario C (tool poisoning) on it_agent ===")
-        for i, text in enumerate(POISONED_TOOL_TURNS):
-            await _drive(client, agent_id="it_agent", text=text, label=f"C.t{i+1}")
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-        print("\nDemo run complete.")
+    print("\nCanonical demo complete.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LT-Sentinel canonical demo run")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--model", default="qwen2.5:7b")
-    parser.add_argument("--qps", type=float, default=8.0)
+    parser = argparse.ArgumentParser(description="LT-Sentinel canonical demo run (LangGraph edition)")
+    parser.add_argument("--qps", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=20260516)
     args = parser.parse_args()
-
-    asyncio.run(run(base_url=args.base_url, model=args.model, qps=args.qps, seed=args.seed))
+    asyncio.run(run(qps=args.qps, seed=args.seed))
 
 
 if __name__ == "__main__":

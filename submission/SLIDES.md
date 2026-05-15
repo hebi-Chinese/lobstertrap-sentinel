@@ -57,13 +57,19 @@ LT-Sentinel adds **cross-event memory** to LT.
 ## Sentinel in one diagram
 
 ```
-agents → Sentinel reverse proxy (:8080)
-            │ atomic current_tier_port
+user → LangGraph Router → HR / Finance / IT worker → ToolNode (Chroma)
+                                  │
+                                  ▼ every LLM call:
+                                  ChatOpenAI(extra_body={"_lobstertrap":{...}})
+                                  │
+                                  ▼
+  Sentinel reverse proxy :8080 (atomic current_tier_port)
+            │
             ├─→ LT-Trust    :18081   policy_trust.yaml     (6 + 2 rules)
             ├─→ LT-Observe  :18082   policy_observe.yaml   (13 + 3 rules)
             └─→ LT-Lockdown :18083   policy_lockdown.yaml  (14 + 4 rules)
                   │   │   │
-                  ▼   ▼   ▼  audit-log JSONL (append-only)
+                  ▼   ▼   ▼  audit-log JSONL
             Sentinel monitor (tail × 3, merge by ts)
                   │
                   ▼   per-event:   sentinel_events.jsonl
@@ -71,6 +77,7 @@ agents → Sentinel reverse proxy (:8080)
                        per-agent:  trust_history.jsonl
 ```
 
+* Real multi-agent system on top: LangGraph `StateGraph`, real `bind_tools`, real `role:"tool"` messages
 * 3 LT processes stay up the whole demo · no LT source change · zero downtime tier swap
 * `agent_id` declarative (production needs OAuth/mTLS in front)
 
@@ -93,18 +100,18 @@ Measured `μ_dev = 0` on N=220 happy-path (judge rejects intent-classifier noise
 
 ---
 
-## Live demo result (one Sentinel start, 184 events)
+## Live demo result (one Sentinel start, 153 ingress events)
 
 ![bg right:55% fit](../sentinel/data/demo_canonical/chart_trust_timeseries.png)
 
 | agent | scenario | final trust | final tier |
 |---|---|---|---|
 | finance | (control) | 1.000 | trust |
-| router | A slow inject | 0.870 | trust |
-| hr_agent | B trust-then-burst | 0.182 | **observe** |
-| it_agent | C tool poison | 0.000 | **lockdown** |
+| router | A slow inject (classified payloads) | 0.058 | **lockdown** |
+| hr_agent | B trust-then-burst | 0.013 | **lockdown** |
+| it_agent | C tool poison (real role:"tool") | 0.000 | **lockdown** |
 
-2 tier swaps captured, each with full evidence trail.
+**6 tier transitions captured, including 2 recoveries** — Scenario A drove system into lockdown, recovery period rebuilt trust through observe → trust, then Scenarios B + C drove it down again. Each transition record has trigger agent, full snapshot, evidence request_ids.
 
 ---
 
@@ -112,24 +119,24 @@ Measured `μ_dev = 0` on N=220 happy-path (judge rejects intent-classifier noise
 
 ```json
 {
-  "from_tier": "observe",
+  "from_tier": "trust",
   "to_tier": "lockdown",
-  "trigger_agent": "it_agent",
-  "trigger_trust_score": 0.025,
+  "trigger_agent": "router",
+  "trigger_trust_score": 0.047,
   "threshold_crossed": "τ_low=0.1",
   "all_agents_trust_snapshot": {
-    "finance_agent": 1.0, "router": 0.87,
-    "hr_agent": 0.18,    "it_agent": 0.025
+    "router": 0.047, "finance_agent": 1.0,
+    "hr_agent": 0.762, "it_agent": 1.0
   },
-  "recent_violation_events": ["req-37","req-45","req-53",
-                              "req-85","req-86","req-88",
-                              "req-5","req-6","req-7"],
+  "recent_violation_events": ["req-39","req-52","req-53","req-3","req-4",
+                              "req-5","req-89","req-90","req-91"],
   "policy_yaml_applied": "policy_lockdown.yaml",
-  "reason_summary": "it_agent TrustScore=0.025 crossed τ_low=0.1; transitioning observe → lockdown"
+  "reason_summary": "router TrustScore=0.047 crossed τ_low=0.1; transitioning trust → lockdown"
 }
 ```
 
 Every `req-N` chains into `sentinel_events.jsonl` → LT's own `lt_audit_*.jsonl`.
+Recoveries (`lockdown → observe → trust`) are recorded with the same shape, threshold marked `(recovery)`.
 
 ---
 
@@ -152,18 +159,20 @@ Every `req-N` chains into `sentinel_events.jsonl` → LT's own `lt_audit_*.jsonl
 * not an identity / authn system (`agent_id` is declarative — production needs OAuth/mTLS)
 * not per-identity policy: LT's current policy YAML doesn't accept `agent_id` as condition → tier change is **global** ("连坐制"). Per-identity policy is an upstream LT change away.
 * not adaptive-attacker robust: SPC has a known blind spot for adversaries tuning rate just under threshold (DESIGN.md §7.4). v2 = randomised thresholds + RL-based detector.
+* startup state replay (rebuild OER/EWMA/CUSUM from `sentinel_events.jsonl` on cold start) is on the implementation backlog — current behaviour is "restart from clean state".
 
 ---
 
-## Repro in 4 commands
+## Repro in 5 commands
 
 ```bash
 cd lobstertrap && go build -o lobstertrap.exe . && cd ..
 cd sentinel && py -m pip install -e .[viz,dev]
-py -m lt_sentinel.cli run        # terminal 1
+py -m lt_agents.cli seed          # one-time Chroma seed
+py -m lt_sentinel.cli run         # terminal 1
 
-py -m scenarios.demo_run         # terminal 2 (drives all 3 attacks)
-py -m scenarios.visualize        # render the chart
+py -m scenarios.demo_run --qps 2  # terminal 2 (drives all 3 attacks)
+py -m scenarios.visualize         # render the chart
 ```
 
 Then inspect `sentinel/data/sentinel_mode_changes.jsonl` for the regulator-readable transition trail.

@@ -111,7 +111,7 @@ Measured `μ_dev = 0` on N=220 happy-path (judge rejects intent-classifier noise
 | hr_agent | B trust-then-burst | 0.013 | **lockdown** |
 | it_agent | C tool poison (real role:"tool") | 0.000 | **lockdown** |
 
-**6 tier transitions captured, including 2 recoveries** — Scenario A drove system into lockdown, recovery period rebuilt trust through observe → trust, then Scenarios B + C drove it down again. Each transition record has trigger agent, full snapshot, evidence request_ids.
+**5 tier transitions captured, including 2 recoveries** — all triggered by the **router**: it's the universal entry point, so it accumulates exposure from every scenario and crosses thresholds first. The middle of the chart shows EWMA decay rebuilding trust (lockdown → observe → trust) once the attack window passes. Each transition record carries trigger agent, full per-agent snapshot, and evidence request_ids.
 
 ---
 

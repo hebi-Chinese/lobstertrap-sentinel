@@ -79,17 +79,21 @@ Talk track and visible commands:
 * **(1:50)** Run `lt-sentinel run`. As the three LT processes spawn:
   > "Three Lobster Trap instances coming up. Trust on 18081, Observe on 18082, Lockdown on 18083. Sentinel proxy on 8080."
 
-* **(2:05)** In a second terminal, run `py -m scenarios.demo_run --qps 8`.
+* **(2:05)** In a second terminal, run `py -m scenarios.demo_run --qps 2`.
+  (Keep QPS at 2 — local Ollama serialises requests; higher QPS just queues and risks timeouts on camera. Edit dead air out in post.)
 
   * Show first few warm-up turns scrolling past (all green `verdict=ALLOW`).
   * As Scenario A turns roll: point out the `block_prompt_injection` DENYs.
-  * As Scenario B turns roll: 20 benign HR turns, then the 4-burst ladder — first burst LT-DENY'd, next 3 progressively riskier.
+  * As Scenario B turns roll: 15 benign HR turns, then the 4-burst ladder — first burst LT-DENY'd, next 3 progressively riskier (note: the router may classify a burst to IT instead of HR — that's a real, defensible routing call, not a bug; narrate it honestly if it shows).
   * As Scenario C turns roll: 8 tool returns escalating, multiple different rules hit.
 
 * **(3:05)** Cut to the rendered chart PNG (`sentinel/data/demo_canonical/chart_trust_timeseries.png`). Pan across it left to right.
   > "Four agents, one chart. Green band is Trust. Yellow is Observe. Red is Lockdown."
-  > "Finance stays at one — control. Router slow-injects — saw-tooth. HR holds at one for thirty turns then drops in four steps and crosses τ_high. IT poisons through and lands in Lockdown."
-  > "Two dashed lines mark the global tier swaps. Sentinel labelled each one with which agent triggered it."
+  > "Finance stays pinned at one — it's the control, it never receives attack traffic."
+  > "Router is the agent that moves. And here's the real finding: Router is the universal entry point — every single user turn passes through it for classification first. So it accumulates exposure from all three attack scenarios at once. Its TrustScore is the first to cross every threshold."
+  > "HR and IT degrade too — they receive the attacks the router forwards — but the router gets there first. Every tier transition in this run was triggered by the router. That's the collective-escalation model: one exposed agent trips, the whole system escalates."
+  > "And watch the middle of the chart — Router climbs back up, lockdown to observe to trust. That's EWMA decay: once the attack window passes, clean traffic pulls the score back. No manual reset."
+  > "Five dashed lines mark the global tier swaps. Sentinel labelled each one with the trigger agent and the threshold crossed."
 
 ---
 
@@ -123,7 +127,9 @@ On-screen bullets:
 
 Voiceover (~40s):
 
-> "Forty lines of Python policy YAML, six hundred lines of Sentinel runtime, twenty-eight unit tests, two hundred and twenty calibration chains. Everything in one MIT-licensed repo, on top of MIT-licensed Lobster Trap."
+> "Three hand-written policy YAMLs, a LangGraph multi-agent system, the Sentinel runtime, thirty-nine unit tests, two hundred and twenty calibration chains. Everything in one MIT-licensed repo, on top of MIT-licensed Lobster Trap."
+>
+> "Two resilience details worth a line: a dormant agent doesn't stay locked down forever — its TrustScore decays back toward baseline on a ten-minute half-life. And Sentinel rebuilds full state from its own audit log on restart, so a crash mid-Lockdown comes back up at the right tier, not at full trust."
 >
 > "Per-identity policy switching is the obvious next step but it needs an upstream change in Lobster Trap to accept `agent_id` as a policy condition field. We flagged that explicitly in the design doc."
 >

@@ -1,8 +1,13 @@
 # Video Presentation Script — LT-Sentinel
 
 **Target**: lablab Track 1 submission. Max **5 minutes**, MP4.
-**Style**: screencast with voiceover. No talking head.
-**Tools**: OBS Studio (free) or Windows Game Bar for capture; any editor for trimming. Voice can be recorded in audacity then mixed.
+
+> **Production note (2026-05-16):** the video shipped as a *narrated slideshow*,
+> not a live screencast — OBS could not capture the terminal on the build
+> machine. The rendered video is `video/lt_sentinel_demo.mp4` (4:37, 1080p MP4,
+> AI voiceover via edge-tts), built reproducibly by `video/build_video.py`.
+> The **authoritative narration text now lives in that script's `SEGMENTS`
+> list** — the screencast script below is kept as the original storyboard.
 
 ---
 

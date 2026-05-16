@@ -43,8 +43,10 @@ Recommended tags (pick whichever the lablab form accepts):
 ## Video Presentation
 
 * Max **5 minutes**, MP4 format (verified 2026-05-15 on https://lablab.ai/delivering-your-hackathon-solution).
-* Script in [`VIDEO_SCRIPT.md`](VIDEO_SCRIPT.md).
-* Production hints in the same file (recording tool, audio levels, export format).
+* **Rendered video: [`video/lt_sentinel_demo.mp4`](video/lt_sentinel_demo.mp4)** — 4:37, 1080p, narrated slideshow (AI voiceover).
+* Reproducible build: `cd submission/video && py build_video.py`. Authoritative narration = the `SEGMENTS` list in `build_video.py`.
+* A subtitled review copy + `.srt` are generated alongside (the review copy is git-ignored).
+* Original storyboard / production notes: [`VIDEO_SCRIPT.md`](VIDEO_SCRIPT.md).
 
 ## Slide Presentation
 

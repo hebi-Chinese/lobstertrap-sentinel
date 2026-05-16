@@ -1,0 +1,192 @@
+1
+00:00:00,000 --> 00:00:07,536
+This is LT-Sentinel — a sidecar that gives Veea's Lobster Trap something it doesn't have today: memory across events.
+
+2
+00:00:08,036 --> 00:00:14,984
+Lobster Trap is excellent at single-event deep prompt inspection — sub-millisecond regex, eight policy actions.
+
+3
+00:00:14,984 --> 00:00:17,738
+But by design it is stateless across events.
+
+4
+00:00:17,738 --> 00:00:22,621
+So it can't see three attack patterns that matter most in multi-agent systems.
+
+5
+00:00:22,621 --> 00:00:30,320
+First, slow injection: an attacker drips pieces of 'ignore your rules' across many turns, and each turn alone looks benign.
+
+6
+00:00:30,320 --> 00:00:36,893
+Second, trust-then-burst: an agent behaves perfectly for thirty turns, then makes one extraction attempt.
+
+7
+00:00:36,893 --> 00:00:43,215
+Third, tool-result poisoning: each tainted tool return looks like noise, but the pattern accumulates.
+
+8
+00:00:43,215 --> 00:00:46,220
+LT-Sentinel is the layer that catches all three.
+
+9
+00:00:46,720 --> 00:00:54,008
+Three Lobster Trap instances run in parallel, each loaded with one of three policies — Trust, Observe, and Lockdown.
+
+10
+00:00:54,008 --> 00:00:55,202
+They never restart.
+
+11
+00:00:55,202 --> 00:01:01,987
+Sentinel adds a reverse proxy on port 8080 that routes to whichever instance matches the current trust tier.
+
+12
+00:01:01,987 --> 00:01:10,972
+It tails all three audit logs, computes a per-agent error rate over a thirty-event window, and feeds it through two statistical control charts.
+
+13
+00:01:10,972 --> 00:01:17,569
+When the resulting trust score crosses a threshold, Sentinel atomically swings the proxy to the new tier.
+
+14
+00:01:17,569 --> 00:01:19,768
+No restart, no source modification.
+
+15
+00:01:20,268 --> 00:01:23,039
+Every knob is anchored to literature.
+
+16
+00:01:23,039 --> 00:01:27,308
+The smoothing factor comes from Lucas and Saccucci, 1990.
+
+17
+00:01:27,308 --> 00:01:32,849
+The change-detection bounds from Page, 1954, and Hawkins and Olwell, 1998.
+
+18
+00:01:32,849 --> 00:01:35,995
+The window size from Munz and Carle, 2008.
+
+19
+00:01:35,995 --> 00:01:40,338
+The baseline prior from Agent Security Bench at ICLR 2025.
+
+20
+00:01:40,338 --> 00:01:42,660
+Nothing here is a magic number.
+
+21
+00:01:43,160 --> 00:01:49,589
+On startup, three Lobster Trap instances come up — Trust, Observe, and Lockdown — alongside the Sentinel proxy.
+
+22
+00:01:49,589 --> 00:01:57,641
+Notice the very first line: this is a restart — Sentinel rebuilt its state from an earlier run's audit log and resumed at the correct tier.
+
+23
+00:01:57,641 --> 00:02:02,622
+That is why the startup clock here is later than the demo data you'll see in a moment.
+
+24
+00:02:02,622 --> 00:02:07,256
+A crash in the middle of lockdown comes back up locked down — not at full trust.
+
+25
+00:02:07,756 --> 00:02:12,503
+The demo drives all three attacks through a real LangGraph multi-agent system.
+
+26
+00:02:12,503 --> 00:02:15,607
+The warm-up turns pass clean — every agent allowed.
+
+27
+00:02:15,607 --> 00:02:23,215
+Then Scenario A, slow injection: the router keeps classifying the payloads, and the prompt-injection rules start firing DENY.
+
+28
+00:02:23,215 --> 00:02:26,380
+Through the recovery phase, benign turns flow again.
+
+29
+00:02:26,880 --> 00:02:39,799
+Scenario B, trust-then-burst: fifteen clean H-R turns, then a four-request burst — the first blocked by Lobster Trap itself, the next three progressively riskier and caught by Sentinel's tiers.
+
+30
+00:02:39,799 --> 00:02:49,104
+Scenario C, tool poisoning: eight tool returns escalate, hitting data-exfiltration, obfuscation, P-I-I, and prompt-injection rules in turn.
+
+31
+00:02:49,604 --> 00:02:51,008
+Four agents, one chart.
+
+32
+00:02:51,008 --> 00:02:54,670
+The green band is Trust, yellow is Observe, red is Lockdown.
+
+33
+00:02:54,670 --> 00:02:59,613
+Finance stays pinned at one — it's the control, it never receives attack traffic.
+
+34
+00:02:59,613 --> 00:03:01,749
+The router is the agent that moves.
+
+35
+00:03:01,749 --> 00:03:15,054
+And here is the real finding: the router is the universal entry point — every user turn passes through it for classification first, so it accumulates exposure from all three scenarios and crosses every threshold first.
+
+36
+00:03:15,054 --> 00:03:20,425
+Watch the middle of the chart — the router climbs back up, lockdown to observe to trust.
+
+37
+00:03:20,425 --> 00:03:27,932
+That's the control chart decaying: once the attack window passes, clean traffic pulls the score back, with no manual reset.
+
+38
+00:03:28,432 --> 00:03:32,233
+This is what Veea's brief called audit trails a regulator could read.
+
+39
+00:03:32,233 --> 00:03:40,441
+Each tier transition records the trigger agent — who tipped the system over — their trust score at the moment of crossing, and which threshold broke.
+
+40
+00:03:40,441 --> 00:03:45,840
+It captures a full snapshot of every other agent's score, so you can prove they were not involved.
+
+41
+00:03:45,840 --> 00:03:53,001
+It lists the violating request IDs as evidence, and each one chains back through the events log into Lobster Trap's own audit log.
+
+42
+00:03:53,001 --> 00:03:58,014
+It records the exact policy file that became active, and a one-line human-readable summary.
+
+43
+00:03:58,014 --> 00:04:00,328
+Recoveries are logged with the same shape.
+
+44
+00:04:00,828 --> 00:04:14,221
+Three hand-written policy files, a LangGraph multi-agent system, the Sentinel runtime, thirty-nine unit tests, two hundred and twenty calibration chains — everything in one open-source repo, on top of open-source Lobster Trap.
+
+45
+00:04:14,221 --> 00:04:23,643
+Two resilience details worth a line: a dormant agent does not stay locked down forever — its trust score decays back toward baseline on a ten-minute half-life.
+
+46
+00:04:23,643 --> 00:04:27,376
+And Sentinel rebuilds full state from its audit log on restart.
+
+47
+00:04:27,376 --> 00:04:32,947
+Per-identity policy is the obvious next step, but it needs an upstream change in Lobster Trap.
+
+48
+00:04:32,947 --> 00:04:37,332
+Thanks to Veea for open-sourcing the floor, and to lablab for the ceiling.
+
